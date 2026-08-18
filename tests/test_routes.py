@@ -194,9 +194,28 @@ def main():
                             "key_origin": "http://10.0.0.5:1234"}, seen
             r = call("POST", "/layout_sort/models", FakeRequest(body="nope"))
             assert r.status == 400
+
+            # Provider presets resolve server-side; base_url is ignored
+            # unless the provider is "custom".
+            call("POST", "/layout_sort/models",
+                 FakeRequest(body={"provider": "openai",
+                                   "base_url": "http://ignored:1/v1"}))
+            assert seen["base_url"] == "https://api.openai.com/v1", seen
+            call("POST", "/layout_sort/models",
+                 FakeRequest(body={"provider": "anthropic"}))
+            assert seen["base_url"] == "https://api.anthropic.com", seen
         finally:
             layout_sort.list_models = original_list_models
         print("models route OK")
+
+        # API-format exports (no positions/links) must fail loudly.
+        api_format = {"3": {"inputs": {}, "class_type": "KSampler"},
+                      "4": {"inputs": {}, "class_type": "SaveImage"}}
+        r = call("POST", "/layout_sort/compute",
+                 FakeRequest(body={"workflow": api_format}))
+        assert r.status == 500 and "API-format" in r.data["error"], \
+            (r.status, r.data)
+        print("api-format guard OK")
     finally:
         os.environ.pop(layout_sort.KEY_FILE_ENV_VAR, None)
         try:

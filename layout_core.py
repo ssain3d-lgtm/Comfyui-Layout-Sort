@@ -48,6 +48,11 @@ DEFAULT_OPTIONS = {
     # node itself belongs here: a trigger wired into it is execution-order
     # plumbing and must not warp the layout it produces.
     "detach_types": ("LayoutSort",),
+    # A layer taller (in left_to_right) than this is split across several
+    # adjacent columns. Same-layer items never link to each other, so the
+    # split cannot create backward links — it just stops huge graphs from
+    # becoming one enormously tall column.
+    "wrap_breadth": 2600,
 }
 
 GROUP_SIDE_PADDING = 24.0
@@ -168,45 +173,84 @@ def _center(item):
 # used both for nodes inside a group and for the coarse cluster graph.
 # ---------------------------------------------------------------------------
 
+def _feedback_edges(pool, preds, succs):
+    """Greedy Eades-Lin-Smyth sequencing: order the nodes so that few
+    edges point backward; those backward edges form the feedback set that
+    layering ignores. In a graph with cycles (loop constructs, or cluster
+    graphs of interlinked groups) only the true loop-back edges end up
+    drawn right-to-left, instead of whole cycles collapsing into one
+    layer."""
+    remaining = set(pool)
+    left, right = [], []
+    while remaining:
+        changed = True
+        while changed:
+            changed = False
+            for iid in pool:  # pool is a list: deterministic order
+                if iid in remaining and not (succs[iid] & remaining):
+                    right.append(iid)
+                    remaining.discard(iid)
+                    changed = True
+            for iid in pool:
+                if iid in remaining and not (preds[iid] & remaining):
+                    left.append(iid)
+                    remaining.discard(iid)
+                    changed = True
+        if remaining:
+            best = max(
+                (iid for iid in pool if iid in remaining),
+                key=lambda v: len(succs[v] & remaining) - len(preds[v] & remaining),
+            )
+            left.append(best)
+            remaining.discard(best)
+    position = {iid: i for i, iid in enumerate(left + list(reversed(right)))}
+    return {(o, t) for o in position for t in succs[o]
+            if t in position and position[o] >= position[t]}
+
+
 def _assign_layers(items, edges):
-    """Longest-path layering over a (mostly) acyclic graph."""
+    """Longest-path layering; cycles are broken via a greedy feedback set."""
     preds = {iid: set() for iid in items}
     succs = {iid: set() for iid in items}
     for origin, target, _slot in edges:
         preds[target].add(origin)
         succs[origin].add(target)
 
-    linked = {iid for iid in items if preds[iid] or succs[iid]}
+    linked = [iid for iid in items if preds[iid] or succs[iid]]
+    linked_set = set(linked)
 
-    indegree = {iid: len(preds[iid]) for iid in linked}
-    frontier = [iid for iid in linked if indegree[iid] == 0]
-    layer = {iid: 0 for iid in frontier}
-    visited = []
-    while frontier:
-        iid = frontier.pop()
-        visited.append(iid)
-        for nxt in succs[iid]:
-            layer[nxt] = max(layer.get(nxt, 0), layer[iid] + 1)
-            indegree[nxt] -= 1
-            if indegree[nxt] == 0:
-                frontier.append(nxt)
+    def layering(feedback):
+        eff_preds = {n: {p for p in preds[n] if (p, n) not in feedback}
+                     for n in linked}
+        eff_succs = {n: {s for s in succs[n] if (n, s) not in feedback}
+                     for n in linked}
+        indegree = {n: len(eff_preds[n]) for n in linked}
+        frontier = [n for n in linked if indegree[n] == 0]
+        layer = {n: 0 for n in frontier}
+        visited = 0
+        while frontier:
+            iid = frontier.pop()
+            visited += 1
+            for nxt in eff_succs[iid]:
+                layer[nxt] = max(layer.get(nxt, 0), layer[iid] + 1)
+                indegree[nxt] -= 1
+                if indegree[nxt] == 0:
+                    frontier.append(nxt)
+        return layer, visited, eff_preds, eff_succs
 
-    # Cycle leftovers (possible in the cluster graph even when the node
-    # graph is a DAG): park them in one extra layer instead of failing.
-    leftovers = linked - set(visited)
-    if leftovers:
-        overflow = (max(layer.values()) + 1) if layer else 0
-        for iid in leftovers:
-            layer[iid] = overflow
+    layer, visited, eff_preds, eff_succs = layering(frozenset())
+    if visited < len(linked):
+        feedback = _feedback_edges(linked, preds, succs)
+        layer, visited, eff_preds, eff_succs = layering(feedback)
 
     # Pull pure sources next to their first consumer so loaders don't all
     # pile up in column 0 regardless of where they are used.
     for iid in linked:
-        if not preds[iid] and succs[iid] and iid not in leftovers:
-            min_succ = min(layer[s] for s in succs[iid])
+        if not eff_preds[iid] and eff_succs[iid]:
+            min_succ = min(layer[s] for s in eff_succs[iid])
             layer[iid] = max(layer[iid], min_succ - 1)
 
-    islands = [iid for iid in items if iid not in linked]
+    islands = [iid for iid in items if iid not in linked_set]
     return layer, preds, succs, islands
 
 
@@ -253,6 +297,30 @@ def _order_layers(items, layer, preds, succs, edges, sweeps):
         sweep(depths, pred_anchors)                  # top-down: follow inputs
         sweep(list(reversed(depths)), succ_anchors)  # bottom-up: follow outputs
     return [layers[d] for d in depths]
+
+
+def _wrap_layers(items, ordered_layers, direction, v_spacing, wrap_breadth):
+    """Split overly tall (or, in top_to_bottom, overly wide) layers into
+    several adjacent columns. Items within one layer never link to each
+    other, so a split can never create a backward link — it only keeps
+    huge graphs from degenerating into one enormous column."""
+    if not wrap_breadth or wrap_breadth <= 0:
+        return ordered_layers
+    dimension = "w" if direction == "top_to_bottom" else "h"
+    wrapped = []
+    for column in ordered_layers:
+        chunk, breadth = [], 0.0
+        for iid in column:
+            extent = items[iid][dimension] + (v_spacing if chunk else 0.0)
+            if chunk and breadth + extent > wrap_breadth:
+                wrapped.append(chunk)
+                chunk, breadth = [], 0.0
+                extent = items[iid][dimension]
+            chunk.append(iid)
+            breadth += extent
+        if chunk:
+            wrapped.append(chunk)
+    return wrapped
 
 
 def _place_layers(items, ordered_layers, direction, h_spacing, v_spacing):
@@ -302,7 +370,11 @@ def _place_islands(items, islands, main_extent, h_spacing, v_spacing):
         return positions
     ordered = sorted(islands, key=lambda iid: (items[iid]["y"], items[iid]["x"]))
     main_w, main_h = main_extent
-    row_limit = max(main_w, 1200.0)
+    # Aim for a roughly square shelf: with many/large islands (e.g. a
+    # container full of unconnected sub-groups) a fixed narrow row limit
+    # would stack them into one enormously tall column.
+    total_area = sum(items[iid]["w"] * items[iid]["h"] for iid in islands)
+    row_limit = max(main_w, 1200.0, 1.25 * math.sqrt(total_area))
     x = 0.0
     y = (main_h + max(h_spacing, v_spacing) * 2.0) if main_h > 0 else 0.0
     row_height = 0.0
@@ -318,13 +390,16 @@ def _place_islands(items, islands, main_extent, h_spacing, v_spacing):
     return positions
 
 
-def _layered_layout(items, edges, direction, h_spacing, v_spacing, sweeps):
+def _layered_layout(items, edges, direction, h_spacing, v_spacing, sweeps,
+                    wrap_breadth=0):
     """Run the full layered pipeline. Returns (positions, (width, height))
     with positions normalized to a tight box anchored at (0, 0)."""
     if not items:
         return {}, (0.0, 0.0)
     layer, preds, succs, islands = _assign_layers(items, edges)
     ordered_layers = _order_layers(items, layer, preds, succs, edges, sweeps)
+    ordered_layers = _wrap_layers(items, ordered_layers, direction,
+                                  v_spacing, wrap_breadth)
     positions, main_extent = _place_layers(
         items, ordered_layers, direction, h_spacing, v_spacing
     )
@@ -420,7 +495,8 @@ def _build_hierarchy(nodes, groups, extra_clusters=None, synthetic_start=0):
 
 
 def _cluster_layout(nodes, edges, groups, direction, h_spacing, v_spacing,
-                    sweeps, extra_clusters=None, synthetic_start=0):
+                    sweeps, extra_clusters=None, synthetic_start=0,
+                    wrap_breadth=0):
     """Recursive compound layout: every group (nested ones included) is laid
     out as its own cluster, then each container arranges its direct child
     clusters and loose nodes with the same layered algorithm. Sibling frames
@@ -478,7 +554,8 @@ def _cluster_layout(nodes, edges, groups, direction, h_spacing, v_spacing,
                 container_edges.append((ro, rt, slot))
 
         positions, (width, height) = _layered_layout(
-            items, container_edges, direction, h_spacing, v_spacing, sweeps
+            items, container_edges, direction, h_spacing, v_spacing, sweeps,
+            wrap_breadth,
         )
         layouts[container] = positions
         if container is not None:
@@ -671,6 +748,7 @@ def compute_layout(workflow, options=None, extra_clusters=None):
     h_spacing = max(10.0, _finite(opts.get("h_spacing", 80), 80))
     v_spacing = max(10.0, _finite(opts.get("v_spacing", 40), 40))
     sweeps = int(_finite(opts.get("barycenter_sweeps", 4), 4))
+    wrap_breadth = max(0.0, _finite(opts.get("wrap_breadth", 2600), 2600))
 
     nodes = _normalize_nodes(workflow)
     if not nodes:
@@ -682,11 +760,12 @@ def compute_layout(workflow, options=None, extra_clusters=None):
     if group_mode == "cluster" and (groups or extra_clusters):
         positions, group_updates = _cluster_layout(
             nodes, edges, groups, direction, h_spacing, v_spacing, sweeps,
-            extra_clusters, synthetic_start,
+            extra_clusters, synthetic_start, wrap_breadth,
         )
     else:
         positions, _extent = _layered_layout(
-            nodes, edges, direction, h_spacing, v_spacing, sweeps
+            nodes, edges, direction, h_spacing, v_spacing, sweeps,
+            wrap_breadth,
         )
         group_updates = _refit_member_groups(groups, nodes, positions)
 

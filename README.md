@@ -40,8 +40,9 @@ ComfyUI를 재시작하면 `utils/layout` 카테고리에 **Layout Sort (Auto Ar
 | `node_spacing` | `40` | 같은 레이어 안 노드 사이 간격 (px) |
 | `group_mode` | `cluster` | 그룹 처리 방식 (아래 참조) |
 | `animate` | `true` | 노드 이동 애니메이션 |
-| `llm_clustering` | `false` | 로컬 LLM으로 그룹 없는 노드를 기능별 클러스터링 (아래 참조) |
-| `llm_base_url` | `http://127.0.0.1:1234/v1` | OpenAI 호환 엔드포인트 (LM Studio 기본값) |
+| `llm_clustering` | `false` | LLM으로 그룹 없는 노드를 기능별 클러스터링 (아래 참조) |
+| `llm_provider` | `lmstudio` | `lmstudio` / `ollama` / `openai`(ChatGPT) / `anthropic`(Claude) / `custom` |
+| `llm_base_url` | `http://127.0.0.1:1234/v1` | `custom`일 때 사용할 엔드포인트 |
 | `llm_model` | `auto` | 사용할 모델. `auto`면 서버의 첫 로드 모델 자동 선택 |
 | `llm_max_tokens` | `4096` | LLM 출력 토큰 한도 (256 ~ 262144). thinking 모델은 크게 |
 
@@ -62,6 +63,13 @@ ComfyUI를 재시작하면 `utils/layout` 카테고리에 **Layout Sort (Auto Ar
 
 두 모드 모두, 노드가 하나도 없는 빈 그룹 프레임은 새 레이아웃 위에 방치되지
 않도록 원래 크기 그대로 레이아웃 아래쪽에 따로 옮겨둡니다.
+
+대형 워크플로우 대응: for-loop 구조처럼 그룹 사이에 순환 참조가 있으면
+탐욕적 feedback-arc 절단으로 **루프백 링크만** 뒤로 향하게 배치하고(순환
+전체가 한 열에 뭉개지지 않음), 한 레이어가 너무 길어지면(기본 2600px)
+같은 레이어의 노드들을 인접한 여러 열로 나눠 배치합니다 — 같은 레이어끼리는
+연결이 없으므로 흐름 방향은 유지됩니다. 연결 없는 하위 그룹 묶음은
+정사각형에 가깝게 선반 배치됩니다.
 
 ## LLM 클러스터 제안 (LM Studio 연동)
 
@@ -102,16 +110,17 @@ JSON과 생성 이미지 PNG 메타데이터에 저장되어 공유 시 그대�
 상태에서 키를 저장하세요. 환경변수 키의 허용 오리진은
 `LAYOUT_SORT_LLM_ALLOWED_ORIGIN`으로 지정합니다 (미지정 시 로컬 전용).
 
-**클라우드 API 사용 (선택)**: 로컬 LM Studio가 기본이지만, OpenAI 호환
-클라우드나 Claude API도 같은 방식으로 연결됩니다.
+**클라우드 API 사용 (선택)**: `llm_provider` 드롭다운에서 고르면 됩니다.
 
-- **ChatGPT (OpenAI)**: `llm_base_url`에 `https://api.openai.com/v1` 입력
-  → 🔑 버튼으로 API 키 저장(그 오리진에 자동 바인딩) → 🔌 Connect로 모델
-  선택. OpenRouter 등 다른 OpenAI 호환 클라우드도 동일합니다.
-- **Claude (Anthropic)**: `llm_base_url`에 `https://api.anthropic.com`
-  입력 → 🔑 버튼으로 키 저장 → 사용. Anthropic Messages API 형식으로
-  자동 전환되며(`x-api-key` 인증 포함), `auto`는 `claude-opus-5`를
-  사용합니다. 🔌 Connect로 다른 모델을 고를 수 있습니다.
+- **ChatGPT**: `llm_provider = openai` → 🔑 버튼으로 API 키 저장(해당
+  오리진에 자동 바인딩) → 🔌 Connect로 모델 선택. OpenRouter 등 다른
+  OpenAI 호환 클라우드는 `custom` + `llm_base_url`로 연결합니다.
+- **Claude**: `llm_provider = anthropic` → 🔑 버튼으로 키 저장 → 사용.
+  Anthropic Messages API 형식으로 자동 전환되며(`x-api-key` 인증 포함),
+  `auto`는 `claude-opus-5`를 사용합니다. 🔌 Connect로 다른 모델(더 저렴한
+  Haiku 등)을 고를 수 있습니다.
+- 프로바이더를 바꾸면 `llm_base_url`에 해당 엔드포인트가 자동으로
+  표시됩니다 (`custom`일 때만 직접 입력한 값이 사용됩니다).
 - **CLI 도구(claude/codex CLI 등) 연동은 지원하지 않습니다** — 의도된
   결정입니다. 이 작업은 단발 JSON 생성이라 API 호출이 정확한 도구이고,
   서버가 로컬 CLI를 실행하는 구조는 ComfyUI 포트 접근자가 구독을 소모

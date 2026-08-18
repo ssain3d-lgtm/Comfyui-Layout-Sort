@@ -694,6 +694,16 @@ def case_anthropic_provider():
     assert llm_client._provider_for("http://127.0.0.1:1234/v1") == "openai"
     assert llm_client._provider_for("https://api.openai.com/v1") == "openai"
 
+    # llm_provider dropdown resolution.
+    resolve = llm_client.resolve_base_url
+    assert resolve("lmstudio", "http://ignored") == "http://127.0.0.1:1234/v1"
+    assert resolve("ollama", "") == "http://127.0.0.1:11434/v1"
+    assert resolve("openai", "") == "https://api.openai.com/v1"
+    assert resolve("anthropic", "") == "https://api.anthropic.com"
+    assert resolve("custom", "http://my.server:8080/v1") == "http://my.server:8080/v1"
+    assert resolve("custom", "") == llm_client.DEFAULT_BASE_URL
+    assert resolve(None, "http://my.server:8080/v1") == "http://my.server:8080/v1"
+
 
 # ---------------------------------------------------------------------------
 # Runner

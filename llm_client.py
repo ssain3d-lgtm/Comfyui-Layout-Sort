@@ -18,6 +18,13 @@ import urllib.request
 LOGGER = logging.getLogger("ComfyUI-Layout-Sort")
 
 DEFAULT_BASE_URL = "http://127.0.0.1:1234/v1"
+# The llm_provider dropdown resolves to these; "custom" uses llm_base_url.
+PROVIDER_PRESETS = {
+    "lmstudio": DEFAULT_BASE_URL,
+    "ollama": "http://127.0.0.1:11434/v1",
+    "openai": "https://api.openai.com/v1",
+    "anthropic": "https://api.anthropic.com",
+}
 # Safe way to supply a token: it never gets serialized into workflows.
 API_KEY_ENV_VAR = "LAYOUT_SORT_LLM_API_KEY"
 # Origin the env-var key may be sent to (loopback is always allowed).
@@ -223,6 +230,15 @@ def _request_json(url, payload, timeout, api_key="", provider="openai"):
         if len(raw) > MAX_RESPONSE_BYTES:
             raise RuntimeError("LLM response exceeds the size limit")
         return json.loads(raw.decode("utf-8", "replace"))
+
+
+def resolve_base_url(provider, base_url):
+    """Turn the llm_provider dropdown value into an endpoint; "custom"
+    (or anything unknown) falls back to the llm_base_url text."""
+    preset = PROVIDER_PRESETS.get((provider or "").strip().lower())
+    if preset:
+        return preset
+    return (base_url or "").strip() or DEFAULT_BASE_URL
 
 
 def _provider_for(base_url):

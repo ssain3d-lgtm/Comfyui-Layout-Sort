@@ -26,6 +26,7 @@ from .llm_client import (
     format_origin,
     is_valid_api_key,
     list_models,
+    resolve_base_url,
     suggest_clusters,
 )
 
@@ -126,6 +127,16 @@ def run_layout(workflow, options, llm_cfg=None):
     """Shared pipeline for the node and the HTTP route: optionally ask the
     local LLM for clusters, then compute the layout (falling back to a
     plain sort whenever the LLM is unavailable)."""
+    if not workflow.get("nodes") and any(
+        isinstance(v, dict) and "class_type" in v
+        for v in workflow.values() if isinstance(v, dict)
+    ):
+        # "Save (API format)" exports carry no positions/links/groups —
+        # there is nothing to lay out. Fail loudly instead of no-opping.
+        raise ValueError(
+            "this looks like an API-format workflow export (no layout "
+            "data); load it into ComfyUI and sort the live graph instead"
+        )
     extra_clusters = None
     llm_info = None
     use_llm = bool(llm_cfg and llm_cfg.get("enabled"))
@@ -144,7 +155,8 @@ def run_layout(workflow, options, llm_cfg=None):
             api_key, key_origin = stored["api_key"], stored["allowed_origin"]
         clusters, error = suggest_clusters(
             workflow,
-            base_url=llm_cfg.get("base_url") or DEFAULT_BASE_URL,
+            base_url=resolve_base_url(llm_cfg.get("provider"),
+                                      llm_cfg.get("base_url")),
             model=llm_cfg.get("model") or "",
             timeout=LLM_TIMEOUT_SECONDS,
             api_key=api_key,
@@ -231,9 +243,15 @@ else:
         key = str(data.get("api_key") or "").strip()
         if len(key) > MAX_KEY_LENGTH:
             return web.json_response({"error": "key too long"}, status=400)
-        # Bind the key to the base_url the node pointed at when it was
-        # saved; loopback targets are always allowed regardless.
-        allowed_origin = format_origin(str(data.get("origin_hint") or ""))
+        # Bind the key to the endpoint the node pointed at when it was
+        # saved; loopback targets are always allowed regardless. With no
+        # hint at all, the key stays loopback-only (None).
+        hint = str(data.get("origin_hint") or "").strip()
+        provider = str(data.get("provider") or "").strip()
+        if provider or hint:
+            allowed_origin = format_origin(resolve_base_url(provider, hint))
+        else:
+            allowed_origin = None
         try:
             store_api_key(key, allowed_origin)
         except ValueError as exc:
@@ -256,7 +274,8 @@ else:
             None,
             functools.partial(
                 list_models,
-                base_url=str(data.get("base_url") or ""),
+                base_url=resolve_base_url(data.get("provider"),
+                                          str(data.get("base_url") or "")),
                 api_key=stored["api_key"],
                 key_origin=stored["allowed_origin"],
             ),
@@ -331,17 +350,25 @@ class LayoutSort:
                 "llm_clustering": (
                     "BOOLEAN",
                     {"default": False,
-                     "tooltip": "Ask a local LLM (LM Studio / any "
-                                "OpenAI-compatible server) to group ungrouped "
+                     "tooltip": "Ask an LLM (local LM Studio/Ollama, or "
+                                "OpenAI/Anthropic cloud) to group ungrouped "
                                 "nodes by function and create named frames "
                                 "for them. Falls back to a plain sort when "
                                 "the server is unreachable."},
                 ),
+                "llm_provider": (
+                    ["lmstudio", "ollama", "openai", "anthropic", "custom"],
+                    {"default": "lmstudio",
+                     "tooltip": "Where the LLM runs. lmstudio/ollama = "
+                                "local; openai = ChatGPT API; anthropic = "
+                                "Claude API; custom = use llm_base_url."},
+                ),
                 "llm_base_url": (
                     "STRING",
                     {"default": DEFAULT_BASE_URL,
-                     "tooltip": "OpenAI-compatible endpoint. LM Studio "
-                                "default: http://127.0.0.1:1234/v1"},
+                     "tooltip": "Endpoint used when llm_provider is "
+                                "\"custom\" (any OpenAI-compatible server). "
+                                "Presets fill this in for reference."},
                 ),
                 # A combo whose real options arrive at runtime: the Connect
                 # button fills widget.options.values from /layout_sort/models.
@@ -390,8 +417,8 @@ class LayoutSort:
         return True
 
     def sort(self, direction, layer_spacing, node_spacing, group_mode, animate,
-             llm_clustering, llm_base_url, llm_model, llm_max_tokens,
-             trigger=None, extra_pnginfo=None, unique_id=None):
+             llm_clustering, llm_provider, llm_base_url, llm_model,
+             llm_max_tokens, trigger=None, extra_pnginfo=None, unique_id=None):
         workflow = (extra_pnginfo or {}).get("workflow")
         server = getattr(PromptServer, "instance", None) if PromptServer else None
         if not workflow or server is None:
@@ -406,6 +433,7 @@ class LayoutSort:
             },
             {
                 "enabled": llm_clustering,
+                "provider": llm_provider,
                 "base_url": llm_base_url,
                 "model": llm_model,
                 "max_tokens": llm_max_tokens,

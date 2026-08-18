@@ -173,6 +173,7 @@ async function sortNow(node) {
     // (key dialog / env var) and must never enter the graph or this payload.
     const llm = {
         enabled: widgetValue(node, "llm_clustering", false),
+        provider: widgetValue(node, "llm_provider", "lmstudio"),
         base_url: widgetValue(node, "llm_base_url", ""),
         model: widgetValue(node, "llm_model", ""),
         max_tokens: widgetValue(node, "llm_max_tokens", 4096),
@@ -294,6 +295,7 @@ async function manageApiKey(node) {
                 api_key: result.key,
                 // Bind the key to the server this node points at; it will
                 // only ever be sent there (or to loopback addresses).
+                provider: widgetValue(node, "llm_provider", "lmstudio"),
                 origin_hint: widgetValue(node, "llm_base_url", ""),
             }),
         });
@@ -320,6 +322,29 @@ async function manageApiKey(node) {
 }
 
 const MODEL_AUTO = "auto";
+const PROVIDER_URLS = {
+    lmstudio: "http://127.0.0.1:1234/v1",
+    ollama: "http://127.0.0.1:11434/v1",
+    openai: "https://api.openai.com/v1",
+    anthropic: "https://api.anthropic.com",
+};
+
+function syncProviderUrl(node) {
+    // Mirror the preset into llm_base_url so the UI shows the endpoint
+    // actually used ("custom" keeps whatever the user typed).
+    const provider = node.widgets?.find((w) => w.name === "llm_provider");
+    const baseUrl = node.widgets?.find((w) => w.name === "llm_base_url");
+    if (!provider || !baseUrl) return;
+    const previous = provider.callback;
+    provider.callback = function (value, ...rest) {
+        previous?.call(this, value, ...rest);
+        const preset = PROVIDER_URLS[value];
+        if (preset) {
+            baseUrl.value = preset;
+            node.setDirtyCanvas?.(true, false);
+        }
+    };
+}
 
 function modelWidget(node) {
     // Declared as a COMBO in Python (initial options: ["auto"]); the
@@ -334,7 +359,10 @@ async function connectModels(node) {
         const res = await api.fetchApi("/layout_sort/models", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ base_url: widgetValue(node, "llm_base_url", "") }),
+            body: JSON.stringify({
+                provider: widgetValue(node, "llm_provider", "lmstudio"),
+                base_url: widgetValue(node, "llm_base_url", ""),
+            }),
         });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const result = await res.json();
@@ -375,6 +403,7 @@ app.registerExtension({
         const onNodeCreated = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function () {
             onNodeCreated?.apply(this, arguments);
+            syncProviderUrl(this);
             // Instant sort without queueing the workflow.
             this.addWidget("button", "✨ Sort now", null, () => sortNow(this));
             this.addWidget("button", "🔌 Connect (load models)", null,
