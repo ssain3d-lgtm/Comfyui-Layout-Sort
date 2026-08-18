@@ -1,0 +1,13 @@
+[project]
+name = "comfyui-layout-sort"
+version = "0.1.0"
+description = "Auto-arranges the current ComfyUI workflow into a clean layered layout based on its data flow, via node execution or a one-click button."
+requires-python = ">=3.9"
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/ssain3d-lgtm/Comfyui-Layout-Sort"
+
+[tool.comfy]
+DisplayName = "ComfyUI Layout Sort"
+PublisherId = "ssain3d"
