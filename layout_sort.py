@@ -149,6 +149,7 @@ def run_layout(workflow, options, llm_cfg=None):
             timeout=LLM_TIMEOUT_SECONDS,
             api_key=api_key,
             key_origin=key_origin,
+            max_tokens=llm_cfg.get("max_tokens"),
         )
         if error:
             llm_info = {"used": False, "error": error}
@@ -350,6 +351,14 @@ class LayoutSort:
                                 "button to list the available models and "
                                 "choose one."},
                 ),
+                "llm_max_tokens": (
+                    "INT",
+                    {"default": 4096, "min": 256, "max": 262144, "step": 256,
+                     "tooltip": "Completion token budget for the LLM. "
+                                "Thinking models spend tokens reasoning "
+                                "before answering — raise this if you see "
+                                "token-limit errors."},
+                ),
             },
             "optional": {
                 "trigger": (
@@ -370,7 +379,7 @@ class LayoutSort:
         return float("nan")
 
     def sort(self, direction, layer_spacing, node_spacing, group_mode, animate,
-             llm_clustering, llm_base_url, llm_model,
+             llm_clustering, llm_base_url, llm_model, llm_max_tokens,
              trigger=None, extra_pnginfo=None, unique_id=None):
         workflow = (extra_pnginfo or {}).get("workflow")
         server = getattr(PromptServer, "instance", None) if PromptServer else None
@@ -388,6 +397,7 @@ class LayoutSort:
                 "enabled": llm_clustering,
                 "base_url": llm_base_url,
                 "model": llm_model,
+                "max_tokens": llm_max_tokens,
             },
         )
         # Target the client that queued this prompt; fall back to broadcast.

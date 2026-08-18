@@ -43,6 +43,7 @@ ComfyUI를 재시작하면 `utils/layout` 카테고리에 **Layout Sort (Auto Ar
 | `llm_clustering` | `false` | 로컬 LLM으로 그룹 없는 노드를 기능별 클러스터링 (아래 참조) |
 | `llm_base_url` | `http://127.0.0.1:1234/v1` | OpenAI 호환 엔드포인트 (LM Studio 기본값) |
 | `llm_model` | `auto` | 사용할 모델. `auto`면 서버의 첫 로드 모델 자동 선택 |
+| `llm_max_tokens` | `4096` | LLM 출력 토큰 한도 (256 ~ 262144). thinking 모델은 크게 |
 
 노드의 **🔌 Connect (load models)** 버튼을 누르면 서버의 모델 목록을
 받아와 `llm_model`이 드롭다운으로 바뀝니다. API 토큰은 보안상 위젯이
@@ -100,6 +101,22 @@ JSON과 생성 이미지 PNG 메타데이터에 저장되어 공유 시 그대�
 그쪽으로 새지 않습니다. 원격 서버에서 키를 쓰려면 그 서버를 가리킨
 상태에서 키를 저장하세요. 환경변수 키의 허용 오리진은
 `LAYOUT_SORT_LLM_ALLOWED_ORIGIN`으로 지정합니다 (미지정 시 로컬 전용).
+
+**클라우드 API 사용 (선택)**: 로컬 LM Studio가 기본이지만, OpenAI 호환
+클라우드나 Claude API도 같은 방식으로 연결됩니다.
+
+- **ChatGPT (OpenAI)**: `llm_base_url`에 `https://api.openai.com/v1` 입력
+  → 🔑 버튼으로 API 키 저장(그 오리진에 자동 바인딩) → 🔌 Connect로 모델
+  선택. OpenRouter 등 다른 OpenAI 호환 클라우드도 동일합니다.
+- **Claude (Anthropic)**: `llm_base_url`에 `https://api.anthropic.com`
+  입력 → 🔑 버튼으로 키 저장 → 사용. Anthropic Messages API 형식으로
+  자동 전환되며(`x-api-key` 인증 포함), `auto`는 `claude-opus-5`를
+  사용합니다. 🔌 Connect로 다른 모델을 고를 수 있습니다.
+- **CLI 도구(claude/codex CLI 등) 연동은 지원하지 않습니다** — 의도된
+  결정입니다. 이 작업은 단발 JSON 생성이라 API 호출이 정확한 도구이고,
+  서버가 로컬 CLI를 실행하는 구조는 ComfyUI 포트 접근자가 구독을 소모
+  시키거나 에이전트 CLI를 통해 더 큰 권한을 얻을 수 있는 보안 문제가
+  있습니다.
 
 알아둘 점: ComfyUI 포트에 접근할 수 있는 사람은 (ComfyUI 특성상 원래
 모든 기능을 쓸 수 있으므로) 키를 새로 덮어쓰거나 LLM 호출에 사용할 수는
@@ -173,11 +190,11 @@ LLM 서버가 없으면 언제나 일반 정렬로 폴백합니다.
 **Q. "reply contains no JSON" 오류가 떠요.**
 대부분 **thinking 모델**(qwen3 등)이 원인입니다. 이런 모델은 답을 내기
 전에 `<think>` 블록 안에서 토큰을 소모하는데, 출력 한도에 걸리면 JSON을
-시작하기도 전에 잘립니다. 현재 버전은 토큰 한도를 4096으로 올렸고, 잘린
-`<think>` 응답을 감지하면 "token limit" 안내가 담긴 구체적인 오류를
-보여줍니다. 그래도 발생하면: 같은 모델의 **non-thinking/instruct 변형**을
-쓰거나, LM Studio에서 컨텍스트 길이를 늘리거나, 더 작은 워크플로우로
-시도해보세요. 정렬 자체는 항상 폴백으로 동작합니다.
+시작하기도 전에 잘립니다. 잘린 `<think>` 응답을 감지하면 "token limit"
+안내가 담긴 구체적인 오류를 보여줍니다. 해결: `llm_max_tokens`를 올리거나
+(모델 컨텍스트가 허용하는 만큼, 최대 262144), 같은 모델의
+**non-thinking/instruct 변형**을 쓰거나, LM Studio에서 컨텍스트 길이를
+늘려보세요. 정렬 자체는 항상 폴백으로 동작합니다.
 
 **Q. 정렬하면 Reroute(경유점)는 어떻게 되나요?**
 최신 ComfyUI의 네이티브 reroute 포인트도 함께 재배치됩니다. 노드 이동

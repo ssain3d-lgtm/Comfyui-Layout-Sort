@@ -29,8 +29,11 @@ MAX_NAME_LENGTH = 60
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 # Thinking models (qwen3 etc.) burn output tokens inside <think> before
 # emitting the JSON answer; a small budget gets truncated mid-think and
-# looks like "reply contains no JSON".
-MAX_COMPLETION_TOKENS = 4096
+# looks like "reply contains no JSON". Users can raise this per-node via
+# the llm_max_tokens widget (up to MAX_COMPLETION_TOKENS_CAP).
+DEFAULT_COMPLETION_TOKENS = 4096
+MAX_COMPLETION_TOKENS_CAP = 262144
+ANTHROPIC_VERSION = "2023-06-01"
 
 SYSTEM_PROMPT = (
     "You are an expert at reading ComfyUI node workflows.\n"
@@ -115,6 +118,15 @@ def build_digest(workflow):
     return "\n".join(lines)
 
 
+def _clamped_tokens(value):
+    """Completion-token budget from the widget, bounded to a sane range."""
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_COMPLETION_TOKENS
+    return max(256, min(MAX_COMPLETION_TOKENS_CAP, number))
+
+
 def is_valid_api_key(key):
     """Bearer tokens must be printable ASCII with no spaces or control
     characters — anything else corrupts the HTTP header, and the resulting
@@ -171,10 +183,10 @@ def key_allowed_for(base_url, key_origin):
 
 
 class _AuthStrippingRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """urllib forwards Authorization across redirects by default, so a
+    """urllib forwards auth headers across redirects by default, so a
     hostile or compromised endpoint could 302 the request elsewhere and
-    capture the token. Drop the header whenever a redirect leaves the
-    original origin (scheme, host, port)."""
+    capture the token. Drop them whenever a redirect leaves the original
+    origin (scheme, host, port)."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         new_request = super().redirect_request(
@@ -182,10 +194,11 @@ class _AuthStrippingRedirectHandler(urllib.request.HTTPRedirectHandler):
         )
         if new_request is not None and _origin(newurl) != _origin(req.full_url):
             new_request.remove_header("Authorization")
+            new_request.remove_header("X-api-key")
         return new_request
 
 
-def _request_json(url, payload, timeout, api_key=""):
+def _request_json(url, payload, timeout, api_key="", provider="openai"):
     # LM Studio runs on localhost: bypass any system proxy configuration.
     opener = urllib.request.build_opener(
         urllib.request.ProxyHandler({}), _AuthStrippingRedirectHandler()
@@ -193,7 +206,12 @@ def _request_json(url, payload, timeout, api_key=""):
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
     headers = {"Content-Type": "application/json"}
     if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
+        if provider == "anthropic":
+            headers["x-api-key"] = api_key
+        else:
+            headers["Authorization"] = f"Bearer {api_key}"
+    if provider == "anthropic":
+        headers["anthropic-version"] = ANTHROPIC_VERSION
     request = urllib.request.Request(
         url,
         data=data,
@@ -207,8 +225,26 @@ def _request_json(url, payload, timeout, api_key=""):
         return json.loads(raw.decode("utf-8", "replace"))
 
 
-def _pick_model(base_url, timeout, api_key=""):
-    data = _request_json(base_url + "/models", None, timeout, api_key)
+def _provider_for(base_url):
+    """"anthropic" for the Anthropic API, "openai" for everything that
+    speaks the OpenAI-compatible format (LM Studio, Ollama, OpenAI...)."""
+    host = _origin(_ensure_scheme(base_url))[1]
+    return "anthropic" if host.endswith("anthropic.com") else "openai"
+
+
+def _models_url(base, provider):
+    if provider == "anthropic":
+        return (format_origin(base) or base) + "/v1/models"
+    return base + "/models"
+
+
+def _pick_model(base_url, timeout, api_key="", provider="openai"):
+    if provider == "anthropic":
+        # Anthropic has no "first loaded model" notion; use the current
+        # default recommendation instead of guessing list order.
+        return "claude-opus-5"
+    data = _request_json(_models_url(base_url, provider), None, timeout,
+                         api_key, provider)
     models = data.get("data") or []
     if not models:
         raise RuntimeError("no model is loaded in LM Studio")
@@ -219,10 +255,13 @@ def list_models(base_url=None, timeout=15, api_key="", key_origin="*"):
     """List model ids from the server (for the node's Connect button).
 
     Returns (model_ids, None) or ([], error_message). The stored/ambient
-    key is attached only when `key_allowed_for` permits it.
+    key is attached only when `key_allowed_for` permits it. Works for
+    OpenAI-compatible servers and the Anthropic API alike (both expose a
+    models listing as {"data": [{"id": ...}]}).
     """
     base = _ensure_scheme((base_url or DEFAULT_BASE_URL).strip().rstrip("/")
                           or DEFAULT_BASE_URL)
+    provider = _provider_for(base)
     api_key = (api_key or "").strip()
     if api_key:
         if not key_allowed_for(base, key_origin) or not is_valid_api_key(api_key):
@@ -233,7 +272,8 @@ def list_models(base_url=None, timeout=15, api_key="", key_origin="*"):
         if env_key and key_allowed_for(base, env_origin) and is_valid_api_key(env_key):
             api_key = env_key
     try:
-        data = _request_json(base + "/models", None, timeout, api_key)
+        data = _request_json(_models_url(base, provider), None, timeout,
+                             api_key, provider)
         models = [str(m.get("id")) for m in data.get("data") or []
                   if isinstance(m, dict) and m.get("id")]
         if not models:
@@ -327,6 +367,29 @@ def _validate(parsed, workflow):
     return clusters
 
 
+def _parse_anthropic_reply(data):
+    """Extract clusters from an Anthropic Messages API response."""
+    stop_reason = data.get("stop_reason")
+    if stop_reason == "refusal":
+        raise ValueError("the model declined this request")
+    text = "\n".join(
+        block.get("text") or ""
+        for block in data.get("content") or []
+        if isinstance(block, dict) and block.get("type") == "text"
+    )
+    try:
+        return _extract_json(text)
+    except ValueError:
+        LOGGER.info("unparseable LLM reply (stop_reason=%s): %.300r",
+                    stop_reason, text)
+        if stop_reason == "max_tokens":
+            raise ValueError(
+                "the model hit its token limit before finishing the answer "
+                "— raise llm_max_tokens"
+            )
+        raise
+
+
 def _parse_reply(data):
     """Extract clusters from a chat completion, with actionable errors."""
     choice = (data.get("choices") or [{}])[0]
@@ -355,7 +418,8 @@ def _parse_reply(data):
 
 
 def suggest_clusters(workflow, base_url=None, model="", timeout=60,
-                     api_key="", key_origin="*"):
+                     api_key="", key_origin="*", max_tokens=None,
+                     provider=None):
     """Ask the local LLM for semantic clusters.
 
     `api_key` is sent as a Bearer token, but only when `key_allowed_for`
@@ -395,31 +459,47 @@ def suggest_clusters(workflow, base_url=None, model="", timeout=60,
     model = (model or "").strip()
     if model.lower() == "auto":
         model = ""
+    budget = int(_clamped_tokens(max_tokens))
+    provider = provider or _provider_for(base)
     try:
-        model_id = model or _pick_model(base, min(timeout, 15), api_key)
-        payload = {
-            "model": model_id,
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": build_digest(workflow)},
-            ],
-            "temperature": 0.2,
-            "max_tokens": MAX_COMPLETION_TOKENS,
-            "response_format": RESPONSE_SCHEMA,
-        }
-        try:
-            data = _request_json(base + "/chat/completions", payload, timeout, api_key)
-        except urllib.error.HTTPError as error:
-            # Some models/servers reject structured output with a 400;
-            # retry plain then. Other statuses (404/401/500...) would fail
-            # identically on retry, so surface them immediately.
-            code = error.code
-            error.close()
-            if code != 400:
-                raise
-            payload.pop("response_format", None)
-            data = _request_json(base + "/chat/completions", payload, timeout, api_key)
-        clusters = _validate(_parse_reply(data), workflow)
+        model_id = model or _pick_model(base, min(timeout, 15), api_key, provider)
+        digest = build_digest(workflow)
+        if provider == "anthropic":
+            payload = {
+                "model": model_id,
+                "max_tokens": budget,
+                "system": SYSTEM_PROMPT,
+                "messages": [{"role": "user", "content": digest}],
+            }
+            url = (format_origin(base) or base) + "/v1/messages"
+            data = _request_json(url, payload, timeout, api_key, provider)
+            clusters = _validate(_parse_anthropic_reply(data), workflow)
+        else:
+            payload = {
+                "model": model_id,
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": digest},
+                ],
+                "temperature": 0.2,
+                "max_tokens": budget,
+                "response_format": RESPONSE_SCHEMA,
+            }
+            try:
+                data = _request_json(base + "/chat/completions", payload,
+                                     timeout, api_key)
+            except urllib.error.HTTPError as error:
+                # Some models/servers reject structured output with a 400;
+                # retry plain then. Other statuses (404/401/500...) would
+                # fail identically on retry, so surface them immediately.
+                code = error.code
+                error.close()
+                if code != 400:
+                    raise
+                payload.pop("response_format", None)
+                data = _request_json(base + "/chat/completions", payload,
+                                     timeout, api_key)
+            clusters = _validate(_parse_reply(data), workflow)
         if not clusters:
             return [], "the model returned no usable clusters"
         LOGGER.info("LLM suggested %d clusters via %s", len(clusters), model_id)

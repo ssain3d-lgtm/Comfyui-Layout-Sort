@@ -55,12 +55,13 @@ class MockLLMServer(ThreadingHTTPServer):
             self.fail_on_response_format = False  # 400 any POST containing it
             self.redirect_models_to = None  # 302 /v1/models to this URL
             self.finish_reason = "stop"
+            self.anthropic_stop = "end_turn"
 
-    def record(self, method, path, body, raw, auth=None):
+    def record(self, method, path, body, raw, auth=None, x_key=None):
         with self.lock:
             self.requests.append(
                 {"method": method, "path": path, "body": body, "raw": raw,
-                 "auth": auth})
+                 "auth": auth, "x_key": x_key})
 
     def snapshot(self):
         with self.lock:
@@ -83,7 +84,8 @@ class MockLLMHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         self.server.record("GET", self.path, None, "",
-                           self.headers.get("Authorization"))
+                           self.headers.get("Authorization"),
+                           self.headers.get("x-api-key"))
         if self.path == "/v1/models":
             target = getattr(self.server, "redirect_models_to", None)
             if target:
@@ -104,7 +106,18 @@ class MockLLMHandler(BaseHTTPRequestHandler):
         except ValueError:
             body = None
         self.server.record("POST", self.path, body, raw,
-                           self.headers.get("Authorization"))
+                           self.headers.get("Authorization"),
+                           self.headers.get("x-api-key"))
+        if self.path == "/v1/messages":  # Anthropic Messages API shape
+            self._send(200, {
+                "id": "msg_mock", "type": "message", "role": "assistant",
+                "model": (body or {}).get("model", "?"),
+                "content": [{"type": "text",
+                             "text": self.server.chat_content}],
+                "stop_reason": getattr(self.server, "anthropic_stop",
+                                       "end_turn"),
+            })
+            return
         if self.path != "/v1/chat/completions":
             self._send(404, {"error": "not found"})
             return
@@ -623,6 +636,63 @@ def case_thinking_truncation():
     assert err is None and clusters, (clusters, err)
     posts = [r for r in SERVER.snapshot() if r["method"] == "POST"]
     assert posts and posts[0]["body"]["model"] == "qwen-test", posts
+
+
+@case("16. llm_max_tokens reaches the request; out-of-range values clamp")
+def case_max_tokens():
+    SERVER.reset()
+    SERVER.chat_content = CONTENT_HAPPY
+    clusters, err = llm_client.suggest_clusters(
+        make_workflow(), base_url=BASE, model="", timeout=30,
+        max_tokens=100000)
+    assert err is None, err
+    posts = [r for r in SERVER.snapshot() if r["method"] == "POST"]
+    assert posts[0]["body"]["max_tokens"] == 100000, posts[0]["body"]
+
+    SERVER.reset()
+    SERVER.chat_content = CONTENT_HAPPY
+    llm_client.suggest_clusters(make_workflow(), base_url=BASE, model="",
+                                timeout=30, max_tokens=99999999)
+    posts = [r for r in SERVER.snapshot() if r["method"] == "POST"]
+    assert posts[0]["body"]["max_tokens"] == llm_client.MAX_COMPLETION_TOKENS_CAP
+
+    SERVER.reset()
+    SERVER.chat_content = CONTENT_HAPPY
+    llm_client.suggest_clusters(make_workflow(), base_url=BASE, model="",
+                                timeout=30, max_tokens=None)
+    posts = [r for r in SERVER.snapshot() if r["method"] == "POST"]
+    assert posts[0]["body"]["max_tokens"] == llm_client.DEFAULT_COMPLETION_TOKENS
+
+
+@case("17. Anthropic provider: /v1/messages, x-api-key, parse + limit error")
+def case_anthropic_provider():
+    SERVER.reset()
+    SERVER.chat_content = CONTENT_HAPPY
+    clusters, err = llm_client.suggest_clusters(
+        make_workflow(), base_url=BASE, model="claude-test", timeout=30,
+        api_key="sk-ant-mock", max_tokens=8192, provider="anthropic")
+    assert err is None and len(clusters) == 2, (clusters, err)
+    posts = [r for r in SERVER.snapshot() if r["method"] == "POST"]
+    assert posts and posts[0]["path"] == "/v1/messages", posts
+    body = posts[0]["body"]
+    assert body["model"] == "claude-test" and body["max_tokens"] == 8192
+    assert "system" in body and "response_format" not in body, body
+    assert posts[0]["x_key"] == "sk-ant-mock" and posts[0]["auth"] is None, \
+        "Anthropic auth must use x-api-key, not Authorization"
+
+    # Token exhaustion surfaces the actionable error.
+    SERVER.reset()
+    SERVER.chat_content = "I was about to answer but"
+    SERVER.anthropic_stop = "max_tokens"
+    clusters, err = llm_client.suggest_clusters(
+        make_workflow(), base_url=BASE, model="claude-test", timeout=30,
+        provider="anthropic")
+    assert clusters == [] and "token limit" in (err or ""), (clusters, err)
+
+    # Provider auto-detection by host.
+    assert llm_client._provider_for("https://api.anthropic.com") == "anthropic"
+    assert llm_client._provider_for("http://127.0.0.1:1234/v1") == "openai"
+    assert llm_client._provider_for("https://api.openai.com/v1") == "openai"
 
 
 # ---------------------------------------------------------------------------
