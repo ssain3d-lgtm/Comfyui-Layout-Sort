@@ -73,6 +73,14 @@ class LayoutSort:
                     {"default": 40, "min": 10, "max": 500, "step": 10,
                      "tooltip": "Gap between nodes inside a layer in pixels."},
                 ),
+                "group_mode": (
+                    ["cluster", "refit"],
+                    {"default": "cluster",
+                     "tooltip": "cluster: lay out each group as a block, then "
+                                "arrange the blocks (frames never overlap). "
+                                "refit: ignore groups while sorting, then "
+                                "re-wrap each frame around its old members."},
+                ),
                 "animate": ("BOOLEAN", {"default": True}),
             },
             "optional": {
@@ -93,7 +101,7 @@ class LayoutSort:
         # Re-run on every queue: sorting is a side effect, never cached.
         return float("nan")
 
-    def sort(self, direction, layer_spacing, node_spacing, animate,
+    def sort(self, direction, layer_spacing, node_spacing, group_mode, animate,
              trigger=None, extra_pnginfo=None, unique_id=None):
         workflow = (extra_pnginfo or {}).get("workflow")
         if not workflow or PromptServer is None:
@@ -102,13 +110,16 @@ class LayoutSort:
             "direction": direction,
             "h_spacing": layer_spacing,
             "v_spacing": node_spacing,
+            "group_mode": group_mode,
         })
+        # Target the client that queued this prompt; fall back to broadcast.
+        sid = getattr(PromptServer.instance, "client_id", None)
         PromptServer.instance.send_sync(WS_EVENT, {
             "positions": result["positions"],
             "groups": result["groups"],
             "animate": bool(animate),
             "source_node": unique_id,
-        })
+        }, sid)
         return {}
 
 

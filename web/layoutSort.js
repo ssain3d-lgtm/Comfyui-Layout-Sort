@@ -20,7 +20,7 @@ function collectMoves(positions) {
 }
 
 function applyGroups(groups) {
-    const graphGroups = app.graph._groups ?? [];
+    const graphGroups = app.graph._groups ?? app.graph.groups ?? [];
     for (const update of groups ?? []) {
         const group = graphGroups[update.index];
         const b = update.bounding;
@@ -33,6 +33,13 @@ function applyGroups(groups) {
 function applyLayout({ positions, groups, animate }) {
     const moves = collectMoves(positions);
     if (!moves.length) return;
+    // A broadcast event may reach a tab showing a different workflow;
+    // only apply when the ids clearly belong to this graph.
+    const total = Object.keys(positions ?? {}).length;
+    if (total > 0 && moves.length / total < 0.9) {
+        console.warn(`[LayoutSort] ignoring layout for a different graph (${moves.length}/${total} ids matched)`);
+        return;
+    }
 
     const finish = () => {
         for (const m of moves) {
@@ -78,6 +85,7 @@ async function sortNow(node) {
         direction: widgetValue(node, "direction", "left_to_right"),
         h_spacing: widgetValue(node, "layer_spacing", 80),
         v_spacing: widgetValue(node, "node_spacing", 40),
+        group_mode: widgetValue(node, "group_mode", "cluster"),
     };
     try {
         const res = await api.fetchApi("/layout_sort/compute", {

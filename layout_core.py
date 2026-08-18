@@ -5,17 +5,28 @@ EXTRA_PNGINFO) and computes new node positions using a layered
 (Sugiyama-style) algorithm:
 
   1. Normalize nodes / links (both array and object link formats).
-  2. Assign each linked node to a layer via longest-path topological
+  2. Assign each linked item to a layer via longest-path topological
      layering, so data flows strictly in one direction.
-  3. Order nodes inside each layer with barycenter sweeps to reduce
+  3. Order items inside each layer with barycenter sweeps to reduce
      link crossings.
   4. Emit coordinates: layers become columns (or rows), centered on a
-     shared axis, anchored at the original graph's top-left corner.
-  5. Nodes with no links (notes, disconnected leftovers) are shelf-packed
-     below the main flow. Group frames are re-fitted around the nodes
-     they contained before the sort.
+     shared axis. Items with no links (notes, disconnected leftovers)
+     are shelf-packed below the main flow.
+
+Group handling (option "group_mode"):
+  * "cluster" (default) — recursive compound layout. Every group (nested
+    ones included) becomes a cluster: its direct member nodes and child
+    clusters are laid out with the same layered algorithm, then each parent
+    container arranges those blocks. Sibling frames can therefore never
+    overlap, at any nesting depth. Each link influences exactly one level:
+    the lowest common ancestor of its endpoints.
+  * "refit" — single-level layout that ignores groups, then re-fits each
+    group frame around the nodes it contained before the sort.
 
 This module has no ComfyUI imports so it can be run and tested standalone.
+All internal math happens in "visual" coordinates (top-left of what is
+drawn, title bar included); conversion to LiteGraph `pos` semantics
+(top of the node body) happens only in compute_layout's final step.
 """
 
 # LiteGraph draws the title bar above node.pos, so a node's visual top is
@@ -25,11 +36,12 @@ TITLE_HEIGHT = 30.0
 DEFAULT_OPTIONS = {
     "direction": "left_to_right",  # or "top_to_bottom"
     "h_spacing": 80,   # gap between layers (columns in left_to_right)
-    "v_spacing": 40,   # gap between nodes inside a layer
+    "v_spacing": 40,   # gap between items inside a layer
+    "group_mode": "cluster",  # or "refit"
     "barycenter_sweeps": 4,
 }
 
-GROUP_PADDING = 24.0
+GROUP_SIDE_PADDING = 24.0
 GROUP_TITLE_PADDING = 40.0
 
 
@@ -43,6 +55,7 @@ def _xy(value, default=(0.0, 0.0)):
 
 
 def _normalize_nodes(workflow):
+    """Return {id: {x, y, w, h}} visual rects (title bar included)."""
     nodes = {}
     for raw in workflow.get("nodes") or []:
         try:
@@ -52,22 +65,18 @@ def _normalize_nodes(workflow):
         pos = _xy(raw.get("pos"))
         size = _xy(raw.get("size"), (140.0, 60.0))
         flags = raw.get("flags") or {}
-        collapsed = bool(flags.get("collapsed"))
-        width = max(size[0], 1.0)
-        body_height = 0.0 if collapsed else max(size[1], 1.0)
+        body_height = 0.0 if flags.get("collapsed") else max(size[1], 1.0)
         nodes[node_id] = {
-            "id": node_id,
             "x": pos[0],
-            "y": pos[1],
-            "width": width,
-            # Visual footprint includes the title bar drawn above pos.
-            "visual_height": body_height + TITLE_HEIGHT,
+            "y": pos[1] - TITLE_HEIGHT,
+            "w": max(size[0], 1.0),
+            "h": body_height + TITLE_HEIGHT,
         }
     return nodes
 
 
 def _normalize_links(workflow, nodes):
-    """Yield (origin_id, target_id, target_slot) for every valid link."""
+    """Return [(origin_id, target_id, target_slot)] for every valid link."""
     edges = []
     for raw in workflow.get("links") or []:
         if isinstance(raw, (list, tuple)) and len(raw) >= 5:
@@ -86,183 +95,361 @@ def _normalize_links(workflow, nodes):
     return edges
 
 
-def _assign_layers(nodes, edges):
+def _normalize_groups(workflow):
+    groups = []
+    for index, raw in enumerate(workflow.get("groups") or []):
+        if not isinstance(raw, dict):
+            continue
+        bounding = raw.get("bounding")
+        if not isinstance(bounding, (list, tuple)) or len(bounding) < 4:
+            continue
+        try:
+            x, y, w, h = (float(v) for v in bounding[:4])
+        except (TypeError, ValueError):
+            continue
+        groups.append({"index": index, "x": x, "y": y, "w": max(w, 1.0), "h": max(h, 1.0)})
+    return groups
+
+
+def _group_contains(group, cx, cy):
+    return (group["x"] <= cx <= group["x"] + group["w"]
+            and group["y"] <= cy <= group["y"] + group["h"])
+
+
+def _group_area(group):
+    return group["w"] * group["h"]
+
+
+def _center(item):
+    return item["x"] + item["w"] / 2.0, item["y"] + item["h"] / 2.0
+
+
+# ---------------------------------------------------------------------------
+# Generic layered engine — works on any items ({id: rect}) + edges, so it is
+# used both for nodes inside a group and for the coarse cluster graph.
+# ---------------------------------------------------------------------------
+
+def _assign_layers(items, edges):
     """Longest-path layering over a (mostly) acyclic graph."""
-    preds = {nid: set() for nid in nodes}
-    succs = {nid: set() for nid in nodes}
+    preds = {iid: set() for iid in items}
+    succs = {iid: set() for iid in items}
     for origin, target, _slot in edges:
         preds[target].add(origin)
         succs[origin].add(target)
 
-    linked = {nid for nid in nodes if preds[nid] or succs[nid]}
+    linked = {iid for iid in items if preds[iid] or succs[iid]}
 
-    indegree = {nid: len(preds[nid]) for nid in linked}
-    frontier = [nid for nid in linked if indegree[nid] == 0]
-    layer = {nid: 0 for nid in frontier}
+    indegree = {iid: len(preds[iid]) for iid in linked}
+    frontier = [iid for iid in linked if indegree[iid] == 0]
+    layer = {iid: 0 for iid in frontier}
     visited = []
     while frontier:
-        nid = frontier.pop()
-        visited.append(nid)
-        for nxt in succs[nid]:
-            layer[nxt] = max(layer.get(nxt, 0), layer[nid] + 1)
+        iid = frontier.pop()
+        visited.append(iid)
+        for nxt in succs[iid]:
+            layer[nxt] = max(layer.get(nxt, 0), layer[iid] + 1)
             indegree[nxt] -= 1
             if indegree[nxt] == 0:
                 frontier.append(nxt)
 
-    # Cycle leftovers (shouldn't happen in executable graphs): park them
-    # in one extra layer instead of failing.
+    # Cycle leftovers (possible in the cluster graph even when the node
+    # graph is a DAG): park them in one extra layer instead of failing.
     leftovers = linked - set(visited)
     if leftovers:
         overflow = (max(layer.values()) + 1) if layer else 0
-        for nid in leftovers:
-            layer[nid] = overflow
+        for iid in leftovers:
+            layer[iid] = overflow
 
     # Pull pure sources next to their first consumer so loaders don't all
     # pile up in column 0 regardless of where they are used.
-    for nid in linked:
-        if not preds[nid] and succs[nid] and nid not in leftovers:
-            min_succ = min(layer[s] for s in succs[nid])
-            layer[nid] = max(layer[nid], min_succ - 1)
+    for iid in linked:
+        if not preds[iid] and succs[iid] and iid not in leftovers:
+            min_succ = min(layer[s] for s in succs[iid])
+            layer[iid] = max(layer[iid], min_succ - 1)
 
-    islands = [nid for nid in nodes if nid not in linked]
+    islands = [iid for iid in items if iid not in linked]
     return layer, preds, succs, islands
 
 
-def _order_layers(nodes, layer, preds, succs, sweeps):
+def _order_layers(items, layer, preds, succs, sweeps):
     """Barycenter ordering to reduce crossings; stable on original y."""
     layers = {}
-    for nid, depth in layer.items():
-        layers.setdefault(depth, []).append(nid)
+    for iid, depth in layer.items():
+        layers.setdefault(depth, []).append(iid)
     depths = sorted(layers)
     for depth in depths:
-        layers[depth].sort(key=lambda nid: (nodes[nid]["y"], nodes[nid]["x"]))
+        layers[depth].sort(key=lambda iid: (items[iid]["y"], items[iid]["x"]))
 
     def sweep(order_by, neighbors):
         for depth in order_by:
             index = {}
             for other_depth in depths:
                 if other_depth != depth:
-                    for i, nid in enumerate(layers[other_depth]):
-                        index[nid] = i
-            current = {nid: i for i, nid in enumerate(layers[depth])}
+                    for i, iid in enumerate(layers[other_depth]):
+                        index[iid] = i
+            current = {iid: i for i, iid in enumerate(layers[depth])}
 
-            def key(nid):
-                anchors = [index[n] for n in neighbors[nid] if n in index]
+            def key(iid):
+                anchors = [index[n] for n in neighbors[iid] if n in index]
                 if not anchors:
-                    return (float(current[nid]), nodes[nid]["y"])
-                return (sum(anchors) / len(anchors), nodes[nid]["y"])
+                    return (float(current[iid]), items[iid]["y"])
+                return (sum(anchors) / len(anchors), items[iid]["y"])
 
             layers[depth].sort(key=key)
 
     for _ in range(max(0, sweeps)):
-        sweep(depths, preds)            # top-down: follow inputs
+        sweep(depths, preds)                  # top-down: follow inputs
         sweep(list(reversed(depths)), succs)  # bottom-up: follow outputs
     return [layers[d] for d in depths]
 
 
-def _place_main(nodes, ordered_layers, origin, direction, h_spacing, v_spacing):
-    """Assign coordinates layer by layer, centered on a shared axis.
-
-    Returns positions keyed by node id, as LiteGraph `pos` values
-    (i.e. top of the node body; title bar sits above it).
-    """
+def _place_layers(items, ordered_layers, direction, h_spacing, v_spacing):
+    """Assign visual top-left coordinates layer by layer, centered on a
+    shared axis. Returns (positions, (main_width, main_height))."""
     positions = {}
     if not ordered_layers:
-        return positions, (origin[0], origin[1], 0.0, 0.0)
+        return positions, (0.0, 0.0)
 
     if direction == "top_to_bottom":
-        thickness = [max(nodes[n]["visual_height"] for n in col) for col in ordered_layers]
+        thickness = [max(items[i]["h"] for i in row) for row in ordered_layers]
         breadth = [
-            sum(nodes[n]["width"] for n in col) + v_spacing * (len(col) - 1)
-            for col in ordered_layers
+            sum(items[i]["w"] for i in row) + v_spacing * (len(row) - 1)
+            for row in ordered_layers
         ]
         max_breadth = max(breadth)
-        main_cursor = origin[1]
-        for col, thick, wide in zip(ordered_layers, thickness, breadth):
-            cross = origin[0] + (max_breadth - wide) / 2.0
-            for nid in col:
-                node = nodes[nid]
-                positions[nid] = [cross, main_cursor + TITLE_HEIGHT]
-                cross += node["width"] + v_spacing
-            main_cursor += thick + h_spacing
-        extent = (max_breadth, main_cursor - h_spacing - origin[1])
-    else:  # left_to_right
-        thickness = [max(nodes[n]["width"] for n in col) for col in ordered_layers]
-        breadth = [
-            sum(nodes[n]["visual_height"] for n in col) + v_spacing * (len(col) - 1)
-            for col in ordered_layers
-        ]
-        max_breadth = max(breadth)
-        main_cursor = origin[0]
-        for col, thick, tall in zip(ordered_layers, thickness, breadth):
-            cross = origin[1] + (max_breadth - tall) / 2.0
-            for nid in col:
-                node = nodes[nid]
-                x = main_cursor + (thick - node["width"]) / 2.0
-                positions[nid] = [x, cross + TITLE_HEIGHT]
-                cross += node["visual_height"] + v_spacing
-            main_cursor += thick + h_spacing
-        extent = (main_cursor - h_spacing - origin[0], max_breadth)
+        main = 0.0
+        for row, thick, wide in zip(ordered_layers, thickness, breadth):
+            cross = (max_breadth - wide) / 2.0
+            for iid in row:
+                positions[iid] = [cross, main]
+                cross += items[iid]["w"] + v_spacing
+            main += thick + h_spacing
+        return positions, (max_breadth, main - h_spacing)
 
-    return positions, (origin[0], origin[1], extent[0], extent[1])
+    # left_to_right
+    thickness = [max(items[i]["w"] for i in col) for col in ordered_layers]
+    breadth = [
+        sum(items[i]["h"] for i in col) + v_spacing * (len(col) - 1)
+        for col in ordered_layers
+    ]
+    max_breadth = max(breadth)
+    main = 0.0
+    for col, thick, tall in zip(ordered_layers, thickness, breadth):
+        cross = (max_breadth - tall) / 2.0
+        for iid in col:
+            positions[iid] = [main + (thick - items[iid]["w"]) / 2.0, cross]
+            cross += items[iid]["h"] + v_spacing
+        main += thick + h_spacing
+    return positions, (main - h_spacing, max_breadth)
 
 
-def _place_islands(nodes, islands, main_rect, h_spacing, v_spacing):
-    """Shelf-pack unlinked nodes (notes etc.) in rows under the main flow."""
+def _place_islands(items, islands, main_extent, h_spacing, v_spacing):
+    """Shelf-pack unlinked items (notes etc.) in rows under the main flow."""
     positions = {}
     if not islands:
         return positions
-    ordered = sorted(islands, key=lambda nid: (nodes[nid]["y"], nodes[nid]["x"]))
-    ox, oy, main_w, main_h = main_rect
+    ordered = sorted(islands, key=lambda iid: (items[iid]["y"], items[iid]["x"]))
+    main_w, main_h = main_extent
     row_limit = max(main_w, 1200.0)
-    x = ox
-    y = oy + main_h + max(h_spacing, v_spacing) * 2.0
+    x = 0.0
+    y = (main_h + max(h_spacing, v_spacing) * 2.0) if main_h > 0 else 0.0
     row_height = 0.0
-    for nid in ordered:
-        node = nodes[nid]
-        if x > ox and (x + node["width"]) > (ox + row_limit):
-            x = ox
+    for iid in ordered:
+        item = items[iid]
+        if x > 0 and (x + item["w"]) > row_limit:
+            x = 0.0
             y += row_height + v_spacing
             row_height = 0.0
-        positions[nid] = [x, y + TITLE_HEIGHT]
-        x += node["width"] + v_spacing
-        row_height = max(row_height, node["visual_height"])
+        positions[iid] = [x, y]
+        x += item["w"] + v_spacing
+        row_height = max(row_height, item["h"])
     return positions
 
 
-def _refit_groups(workflow, nodes, positions):
-    """Re-fit each group frame around the nodes it visually contained
-    before the sort, so groups keep their meaning after nodes move."""
+def _layered_layout(items, edges, direction, h_spacing, v_spacing, sweeps):
+    """Run the full layered pipeline. Returns (positions, (width, height))
+    with positions normalized to a tight box anchored at (0, 0)."""
+    if not items:
+        return {}, (0.0, 0.0)
+    layer, preds, succs, islands = _assign_layers(items, edges)
+    ordered_layers = _order_layers(items, layer, preds, succs, sweeps)
+    positions, main_extent = _place_layers(
+        items, ordered_layers, direction, h_spacing, v_spacing
+    )
+    positions.update(_place_islands(items, islands, main_extent, h_spacing, v_spacing))
+
+    min_x = min(p[0] for p in positions.values())
+    min_y = min(p[1] for p in positions.values())
+    for p in positions.values():
+        p[0] -= min_x
+        p[1] -= min_y
+    width = max(p[0] + items[iid]["w"] for iid, p in positions.items())
+    height = max(p[1] + items[iid]["h"] for iid, p in positions.items())
+    return positions, (width, height)
+
+
+# ---------------------------------------------------------------------------
+# Group handling
+# ---------------------------------------------------------------------------
+
+def _build_hierarchy(nodes, groups):
+    """Containment forest over groups plus deepest-group node membership.
+
+    A group's parent is the smallest group with a strictly larger area whose
+    bounds contain its center (strict area ordering keeps this acyclic).
+    Each node belongs to the smallest group containing its center.
+    """
+    by_index = {g["index"]: g for g in groups}
+    parent = {}
+    for group in groups:
+        enclosing = [
+            other for other in groups
+            if other is not group
+            and _group_area(other) > _group_area(group)
+            and _group_contains(other, *_center(group))
+        ]
+        parent[group["index"]] = (
+            min(enclosing, key=_group_area)["index"] if enclosing else None
+        )
+
+    children = {index: [] for index in by_index}
+    roots = []
+    for index in sorted(by_index):
+        if parent[index] is None:
+            roots.append(index)
+        else:
+            children[parent[index]].append(index)
+
+    node_group = {}
+    for nid, node in nodes.items():
+        containing = [g for g in groups if _group_contains(g, *_center(node))]
+        if containing:
+            node_group[nid] = min(containing, key=_group_area)["index"]
+
+    # Chain of containers from a node's deepest group up to the root (None).
+    chains = {}
+    for nid in nodes:
+        chain = []
+        cursor = node_group.get(nid)
+        while cursor is not None:
+            chain.append(cursor)
+            cursor = parent[cursor]
+        chain.append(None)
+        chains[nid] = chain
+    return children, roots, node_group, chains
+
+
+def _cluster_layout(nodes, edges, groups, direction, h_spacing, v_spacing, sweeps):
+    """Recursive compound layout: every group (nested ones included) is laid
+    out as its own cluster, then each container arranges its direct child
+    clusters and loose nodes with the same layered algorithm. Sibling frames
+    can therefore never overlap, at any nesting depth."""
+    children, root_groups, node_group, chains = _build_hierarchy(nodes, groups)
+    by_index = {g["index"]: g for g in groups}
+
+    direct_nodes = {index: [] for index in by_index}
+    direct_nodes[None] = []
+    for nid in nodes:
+        direct_nodes[node_group.get(nid)].append(nid)
+
+    def has_content(gindex):
+        return bool(direct_nodes[gindex]) or any(has_content(c) for c in children[gindex])
+
+    def representative(nid, container):
+        """The direct child of `container` that transitively holds `nid`,
+        or None when the node is not inside `container` at all."""
+        chain = chains[nid]
+        if container not in chain:
+            return None
+        i = chain.index(container)
+        if i == 0:
+            return ("node", nid)
+        return ("group", chain[i - 1])
+
+    layouts = {}      # container -> relative item positions
+    frame_size = {}   # group index -> (w, h) including frame padding
+
+    def layout_container(container):
+        items = {}
+        child_groups = children[container] if container is not None else root_groups
+        for gindex in child_groups:
+            if not has_content(gindex):
+                continue
+            layout_container(gindex)
+            group = by_index[gindex]
+            width, height = frame_size[gindex]
+            items[("group", gindex)] = {
+                "x": group["x"], "y": group["y"], "w": width, "h": height,
+            }
+        for nid in direct_nodes[container]:
+            items[("node", nid)] = nodes[nid]
+
+        # Each link surfaces exactly once: at the container that is the
+        # lowest common ancestor of its two endpoints.
+        container_edges = []
+        for origin, target, slot in edges:
+            ro = representative(origin, container)
+            rt = representative(target, container)
+            if ro is not None and rt is not None and ro != rt:
+                container_edges.append((ro, rt, slot))
+
+        positions, (width, height) = _layered_layout(
+            items, container_edges, direction, h_spacing, v_spacing, sweeps
+        )
+        layouts[container] = positions
+        if container is not None:
+            frame_size[container] = (
+                width + GROUP_SIDE_PADDING * 2.0,
+                height + GROUP_TITLE_PADDING + GROUP_SIDE_PADDING,
+            )
+
+    layout_container(None)
+
+    positions = {}
+    frames = {}
+
+    def emit(container, offset_x, offset_y):
+        for key, rel in layouts[container].items():
+            kind, ident = key
+            x, y = offset_x + rel[0], offset_y + rel[1]
+            if kind == "node":
+                positions[ident] = [x, y]
+            else:
+                width, height = frame_size[ident]
+                frames[ident] = [x, y, width, height]
+                emit(ident, x + GROUP_SIDE_PADDING, y + GROUP_TITLE_PADDING)
+
+    emit(None, 0.0, 0.0)
+    updates = [{"index": index, "bounding": bounding}
+               for index, bounding in sorted(frames.items())]
+    return positions, updates
+
+
+def _refit_member_groups(groups, nodes, positions):
+    """group_mode="refit": re-fit every group frame around the nodes it
+    visually contained before the sort, so groups keep their meaning."""
     updates = []
-    for index, group in enumerate(workflow.get("groups") or []):
-        bounding = group.get("bounding")
-        if not isinstance(bounding, (list, tuple)) or len(bounding) < 4:
-            continue
-        gx, gy, gw, gh = (float(v) for v in bounding[:4])
-        members = []
-        for nid, node in nodes.items():
-            cx = node["x"] + node["width"] / 2.0
-            cy = node["y"] - TITLE_HEIGHT + node["visual_height"] / 2.0
-            if gx <= cx <= gx + gw and gy <= cy <= gy + gh:
-                members.append(nid)
-        placed = [nid for nid in members if nid in positions]
+    for group in groups:
+        placed = [
+            nid for nid, node in nodes.items()
+            if nid in positions and _group_contains(group, *_center(node))
+        ]
         if not placed:
             continue
-        min_x = min(positions[n][0] for n in placed)
-        min_y = min(positions[n][1] - TITLE_HEIGHT for n in placed)
-        max_x = max(positions[n][0] + nodes[n]["width"] for n in placed)
-        max_y = max(positions[n][1] - TITLE_HEIGHT + nodes[n]["visual_height"] for n in placed)
+        min_x = min(positions[n][0] for n in placed) - GROUP_SIDE_PADDING
+        min_y = min(positions[n][1] for n in placed) - GROUP_TITLE_PADDING
+        max_x = max(positions[n][0] + nodes[n]["w"] for n in placed) + GROUP_SIDE_PADDING
+        max_y = max(positions[n][1] + nodes[n]["h"] for n in placed) + GROUP_SIDE_PADDING
         updates.append({
-            "index": index,
-            "bounding": [
-                min_x - GROUP_PADDING,
-                min_y - GROUP_TITLE_PADDING,
-                (max_x - min_x) + GROUP_PADDING * 2.0,
-                (max_y - min_y) + GROUP_TITLE_PADDING + GROUP_PADDING,
-            ],
+            "index": group["index"],
+            "bounding": [min_x, min_y, max_x - min_x, max_y - min_y],
         })
     return updates
 
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def compute_layout(workflow, options=None):
     """Compute a tidy layout for a serialized ComfyUI workflow.
@@ -274,31 +461,47 @@ def compute_layout(workflow, options=None):
     if options:
         opts.update({k: v for k, v in options.items() if v is not None})
     direction = opts.get("direction") or "left_to_right"
+    group_mode = opts.get("group_mode") or "cluster"
     h_spacing = max(10.0, float(opts.get("h_spacing", 80)))
     v_spacing = max(10.0, float(opts.get("v_spacing", 40)))
+    sweeps = int(opts.get("barycenter_sweeps", 4))
 
     nodes = _normalize_nodes(workflow)
     if not nodes:
         return {"positions": {}, "groups": []}
-
     edges = _normalize_links(workflow, nodes)
-    layer, preds, succs, islands = _assign_layers(nodes, edges)
-    ordered_layers = _order_layers(nodes, layer, preds, succs, opts["barycenter_sweeps"])
+    groups = _normalize_groups(workflow)
+
+    if group_mode == "cluster" and groups:
+        positions, group_updates = _cluster_layout(
+            nodes, edges, groups, direction, h_spacing, v_spacing, sweeps
+        )
+    else:
+        positions, _extent = _layered_layout(
+            nodes, edges, direction, h_spacing, v_spacing, sweeps
+        )
+        group_updates = _refit_member_groups(groups, nodes, positions)
 
     # Anchor the new layout at the old graph's visual top-left so the
-    # canvas view doesn't jump to a different region.
-    origin = (
-        min(n["x"] for n in nodes.values()),
-        min(n["y"] - TITLE_HEIGHT for n in nodes.values()),
-    )
-
-    positions, main_rect = _place_main(
-        nodes, ordered_layers, origin, direction, h_spacing, v_spacing
-    )
-    positions.update(_place_islands(nodes, islands, main_rect, h_spacing, v_spacing))
-    groups = _refit_groups(workflow, nodes, positions)
-
+    # canvas view doesn't jump to a different region, and convert visual
+    # tops back to LiteGraph pos (top of the node body).
+    origin_x = min(n["x"] for n in nodes.values())
+    origin_y = min(n["y"] for n in nodes.values())
     return {
-        "positions": {str(nid): pos for nid, pos in positions.items()},
-        "groups": groups,
+        "positions": {
+            str(nid): [origin_x + p[0], origin_y + p[1] + TITLE_HEIGHT]
+            for nid, p in positions.items()
+        },
+        "groups": [
+            {
+                "index": u["index"],
+                "bounding": [
+                    origin_x + u["bounding"][0],
+                    origin_y + u["bounding"][1],
+                    u["bounding"][2],
+                    u["bounding"][3],
+                ],
+            }
+            for u in group_updates
+        ],
     }
