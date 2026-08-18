@@ -971,6 +971,7 @@ def compute_layout(workflow, options=None, extra_clusters=None):
         group_updates = _refit_member_groups(groups, nodes, positions)
 
 
+    refitted = list(group_updates)
     if group_mode != "inner":
         # In inner mode untouched groups stay exactly where the user put
         # them — parking would defeat the point of preserving the macro
@@ -985,13 +986,26 @@ def compute_layout(workflow, options=None, extra_clusters=None):
 
     # Anchor the new layout at the old graph's visual top-left so the
     # canvas view doesn't jump to a different region, and convert visual
-    # tops back to LiteGraph pos (top of the node body). Inner mode is
+    # tops back to LiteGraph pos (top of the node body). Both sides of the
+    # anchor cover nodes AND live frames — a frame's padding sits before
+    # its first node, so a nodes-only anchor would walk the whole graph by
+    # one padding per re-sort instead of being a fixed point. Parked stale
+    # frames are relocated anyway and stay out of it. Inner mode is
     # already absolute — every subtree is anchored at its group's corner.
     if group_mode == "inner":
         origin_x = origin_y = 0.0
     else:
-        origin_x = min(n["x"] for n in nodes.values())
-        origin_y = min(n["y"] for n in nodes.values())
+        by_index = {g["index"]: g for g in groups}
+        old_frames = [by_index[u["index"]] for u in refitted
+                      if u["index"] in by_index]
+        origin_x = (min([n["x"] for n in nodes.values()]
+                        + [g["x"] for g in old_frames])
+                    - min([p[0] for p in positions.values()]
+                          + [u["bounding"][0] for u in refitted]))
+        origin_y = (min([n["y"] for n in nodes.values()]
+                        + [g["y"] for g in old_frames])
+                    - min([p[1] for p in positions.values()]
+                          + [u["bounding"][1] for u in refitted]))
 
     def rounded(value):
         return round(value / snap) * snap if snap else value

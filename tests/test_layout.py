@@ -438,4 +438,47 @@ for _lid, o, _os, t, _ts, _ty in BASE["links"]:
     assert pos_v[o][1] + o_h <= pos_v[t][1] - TITLE_HEIGHT + 1e-6, \
         f"link {o}->{t} does not flow top to bottom"
 print("degenerate + vertical OK")
+
+# ------------------------------ re-sorting a sorted layout is a fixed point
+# The anchor must cover frames as well as nodes: a frame's padding sits
+# before its first node, so a nodes-only anchor walks the whole graph by
+# one padding per re-sort (regression: +20/+40px per click).
+idem_wf = {
+    "nodes": [
+        node(1, "Load", [40, 30], [200, 100]),
+        node(2, "Proc", [400, 30], [200, 100]),
+        node(3, "Loose", [100, 800], [180, 90]),
+    ],
+    "links": [[1, 1, 0, 2, 0, "X"]],
+    "groups": [{"title": "G", "bounding": [-20, -60, 700, 260]}],
+}
+
+
+def apply_back(state, res):
+    for n in state["nodes"]:
+        q = res["positions"].get(str(n["id"]))
+        if q:
+            n["pos"] = [q[0], q[1]]
+    for u in res["groups"]:
+        state["groups"][u["index"]]["bounding"] = list(u["bounding"])
+
+
+for idem_mode in ("cluster", "inner"):
+    state = {
+        "nodes": [dict(n) for n in idem_wf["nodes"]],
+        "links": [list(l) for l in idem_wf["links"]],
+        "groups": [{"title": "G", "bounding": [-20, -60, 700, 260]}],
+    }
+    runs = []
+    for _ in range(3):
+        res = compute_layout(state, {"group_mode": idem_mode})
+        runs.append(res)
+        apply_back(state, res)
+    assert runs[1]["positions"] == runs[2]["positions"], \
+        f"{idem_mode}: third sort drifted {runs[1]['positions']} " \
+        f"-> {runs[2]['positions']}"
+    b1 = {u["index"]: u["bounding"] for u in runs[1]["groups"]}
+    b2 = {u["index"]: u["bounding"] for u in runs[2]["groups"]}
+    assert b1 == b2, f"{idem_mode}: frames drifted {b1} -> {b2}"
+print("idempotent re-sort OK")
 print("ALL CHECKS PASSED")
