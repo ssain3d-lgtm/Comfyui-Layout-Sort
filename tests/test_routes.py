@@ -112,13 +112,25 @@ def main():
     os.environ[layout_sort.KEY_FILE_ENV_VAR] = handle.name
     try:
         r = call("GET", "/layout_sort/api_key", FakeRequest())
-        assert r.data == {"configured": False, "source": "none"}, r.data
+        assert r.data == {"configured": False, "source": "none",
+                          "allowed_origin": None}, r.data
 
+        # origin_hint binds the key to the base_url it was saved against
+        r = call("POST", "/layout_sort/api_key",
+                 FakeRequest(body={"api_key": "sk-route",
+                                   "origin_hint": "http://192.168.0.10:1234/v1"}))
+        assert r.status == 200 and r.data == {
+            "configured": True, "source": "file",
+            "allowed_origin": "http://192.168.0.10:1234"}, (r.status, r.data)
+        assert layout_sort.load_stored_api_key() == "sk-route"
+        info = layout_sort.load_stored_key_info()
+        assert info == {"api_key": "sk-route",
+                        "allowed_origin": "http://192.168.0.10:1234"}, info
+
+        # saving without a hint leaves the key loopback-only
         r = call("POST", "/layout_sort/api_key",
                  FakeRequest(body={"api_key": "sk-route"}))
-        assert r.status == 200 and r.data == {"configured": True,
-                                              "source": "file"}, (r.status, r.data)
-        assert layout_sort.load_stored_api_key() == "sk-route"
+        assert r.data["allowed_origin"] is None, r.data
 
         r = call("POST", "/layout_sort/api_key",
                  FakeRequest(body={"api_key": "x" * (layout_sort.MAX_KEY_LENGTH + 1)}))
@@ -145,10 +157,38 @@ def main():
         os.environ[llm_client.API_KEY_ENV_VAR] = "sk-env"
         try:
             r = call("GET", "/layout_sort/api_key", FakeRequest())
-            assert r.data == {"configured": True, "source": "env"}, r.data
+            assert r.data == {"configured": True, "source": "env",
+                              "allowed_origin": None}, r.data
         finally:
             del os.environ[llm_client.API_KEY_ENV_VAR]
         print("api_key route OK")
+
+        # /layout_sort/models proxies list_models with the stored key info
+        call("POST", "/layout_sort/api_key",
+             FakeRequest(body={"api_key": "sk-models",
+                               "origin_hint": "http://10.0.0.5:1234/v1"}))
+        seen = {}
+
+        def fake_list_models(base_url="", api_key="", key_origin=None):
+            seen.update(base_url=base_url, api_key=api_key,
+                        key_origin=key_origin)
+            return ["model-a", "model-b"], None
+
+        original_list_models = layout_sort.list_models
+        layout_sort.list_models = fake_list_models
+        try:
+            r = call("POST", "/layout_sort/models",
+                     FakeRequest(body={"base_url": "http://10.0.0.5:1234/v1"}))
+            assert r.status == 200 and r.data == {
+                "models": ["model-a", "model-b"], "error": None}, (r.status, r.data)
+            assert seen == {"base_url": "http://10.0.0.5:1234/v1",
+                            "api_key": "sk-models",
+                            "key_origin": "http://10.0.0.5:1234"}, seen
+            r = call("POST", "/layout_sort/models", FakeRequest(body="nope"))
+            assert r.status == 400
+        finally:
+            layout_sort.list_models = original_list_models
+        print("models route OK")
     finally:
         os.environ.pop(layout_sort.KEY_FILE_ENV_VAR, None)
         try:

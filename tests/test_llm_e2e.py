@@ -54,6 +54,7 @@ class MockLLMServer(ThreadingHTTPServer):
             self.chat_content = "{}"     # message.content returned on success
             self.fail_on_response_format = False  # 400 any POST containing it
             self.redirect_models_to = None  # 302 /v1/models to this URL
+            self.finish_reason = "stop"
 
     def record(self, method, path, body, raw, auth=None):
         with self.lock:
@@ -121,7 +122,7 @@ class MockLLMHandler(BaseHTTPRequestHandler):
                 "index": 0,
                 "message": {"role": "assistant",
                             "content": self.server.chat_content},
-                "finish_reason": "stop",
+                "finish_reason": getattr(self.server, "finish_reason", "stop"),
             }],
         })
 
@@ -573,6 +574,55 @@ def case_redirect_strips_auth():
             f"token must not follow a cross-origin redirect: {second_hop}"
     finally:
         other.shutdown()
+
+
+@case("14. stored keys are origin-bound; loopback targets always allowed")
+def case_key_origin_binding():
+    allowed = llm_client.key_allowed_for
+    # Loopback targets always receive the key, whatever the binding.
+    assert allowed("http://127.0.0.1:1234/v1", None)
+    assert allowed("http://localhost:1234/v1", None)
+    assert allowed(BASE, "https://api.example.com")
+    # Non-loopback targets need an exact origin match.
+    assert not allowed("https://evil.example/v1", None)
+    assert not allowed("https://evil.example/v1", "https://api.example.com")
+    assert allowed("https://api.example.com/v1", "https://api.example.com")
+    assert allowed("https://api.example.com:443/v1", "https://api.example.com")
+    assert not allowed("http://api.example.com/v1", "https://api.example.com")
+    # "*" means the caller explicitly paired key and URL.
+    assert allowed("https://anything.example/v1", "*")
+
+    # Integration: a loopback-bound (None) stored key still reaches the
+    # loopback mock server through suggest_clusters.
+    SERVER.reset()
+    SERVER.chat_content = CONTENT_HAPPY
+    clusters, err = llm_client.suggest_clusters(
+        make_workflow(), base_url=BASE, model="", timeout=30,
+        api_key="sk-bound", key_origin=None)
+    assert err is None, f"unexpected error: {err!r}"
+    auths = [r["auth"] for r in SERVER.snapshot()]
+    assert auths and all(a == "Bearer sk-bound" for a in auths), auths
+
+
+@case("15. truncated thinking reply yields an actionable token-limit error")
+def case_thinking_truncation():
+    SERVER.reset()
+    # Unterminated <think>: the model burned the whole budget reasoning.
+    SERVER.chat_content = "<think>step 1... step 2... let me reconsider"
+    SERVER.finish_reason = "length"
+    clusters, err = llm_client.suggest_clusters(
+        make_workflow(), base_url=BASE, model="", timeout=30)
+    assert clusters == [] and err, (clusters, err)
+    assert "token limit" in err, f"error should explain the token limit: {err!r}"
+
+    # An "auto" model value behaves like empty (auto-pick).
+    SERVER.reset()
+    SERVER.chat_content = CONTENT_HAPPY
+    clusters, err = llm_client.suggest_clusters(
+        make_workflow(), base_url=BASE, model="auto", timeout=30)
+    assert err is None and clusters, (clusters, err)
+    posts = [r for r in SERVER.snapshot() if r["method"] == "POST"]
+    assert posts and posts[0]["body"]["model"] == "qwen-test", posts
 
 
 # ---------------------------------------------------------------------------

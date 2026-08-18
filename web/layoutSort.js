@@ -35,6 +35,27 @@ function applyGroups(groups) {
     }
 }
 
+function applyReroutes(reroutes) {
+    // Native reroute points (graph.reroutes Map). reroute.move() also
+    // syncs the Vue layout store used for hit-testing; fall back to a
+    // plain pos assignment on frontends without it.
+    const map = app.graph.reroutes;
+    if (!map?.get) return;
+    for (const [id, pos] of Object.entries(reroutes ?? {})) {
+        const reroute = map.get(Number(id));
+        if (!reroute || !Array.isArray(pos)) continue;
+        try {
+            if (typeof reroute.move === "function") {
+                reroute.move(pos[0] - reroute.pos[0], pos[1] - reroute.pos[1]);
+            } else {
+                reroute.pos = [pos[0], pos[1]];
+            }
+        } catch (err) {
+            console.warn("[LayoutSort] could not move reroute", id, err);
+        }
+    }
+}
+
 function createGroups(newGroups) {
     const LGraphGroup = window.LiteGraph?.LGraphGroup;
     if (!newGroups?.length || !LGraphGroup) return;
@@ -80,7 +101,7 @@ function notifyLlm(llm) {
     }
 }
 
-function applyLayout({ positions, groups, new_groups, llm, animate }) {
+function applyLayout({ positions, groups, new_groups, reroutes, llm, animate }) {
     const moves = collectMoves(positions);
     if (!moves.length) return;
     // A broadcast event may reach a tab showing a different workflow;
@@ -92,13 +113,20 @@ function applyLayout({ positions, groups, new_groups, llm, animate }) {
     }
     notifyLlm(llm);
 
+    // One sort = one undo step: the frontend's change tracker snapshots
+    // around beforeChange/afterChange, so Ctrl+Z restores the pre-sort
+    // layout in a single stroke.
+    app.graph.beforeChange?.();
+
     const finish = () => {
         for (const m of moves) {
             m.node.pos[0] = m.to[0];
             m.node.pos[1] = m.to[1];
         }
         applyGroups(groups);
+        applyReroutes(reroutes);
         createGroups(new_groups);
+        app.graph.afterChange?.();
         app.graph.setDirtyCanvas(true, true);
     };
 
@@ -160,6 +188,7 @@ async function sortNow(node) {
             positions: result.positions,
             groups: result.groups,
             new_groups: result.new_groups,
+            reroutes: result.reroutes,
             llm: result.llm,
             animate: widgetValue(node, "animate", true),
         });
@@ -260,7 +289,12 @@ async function manageApiKey(node) {
         const res = await api.fetchApi("/layout_sort/api_key", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ api_key: result.key }),
+            body: JSON.stringify({
+                api_key: result.key,
+                // Bind the key to the server this node points at; it will
+                // only ever be sent there (or to loopback addresses).
+                origin_hint: widgetValue(node, "llm_base_url", ""),
+            }),
         });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const status = await res.json();
@@ -284,6 +318,62 @@ async function manageApiKey(node) {
     refreshKeyStatus(node);
 }
 
+const MODEL_AUTO = "auto";
+
+function modelWidget(node) {
+    return node.widgets?.find((w) => w.name === "llm_model");
+}
+
+function upgradeModelWidget(node) {
+    // The backend declares llm_model as STRING (so any value validates);
+    // present it as a dropdown that the Connect button fills in.
+    const widget = modelWidget(node);
+    if (!widget) return;
+    widget.type = "combo";
+    widget.options = widget.options ?? {};
+    if (!Array.isArray(widget.options.values) || !widget.options.values.length) {
+        widget.options.values = [MODEL_AUTO];
+    }
+    if (!widget.value) widget.value = MODEL_AUTO;
+}
+
+async function connectModels(node) {
+    const toast = app.extensionManager?.toast;
+    try {
+        const res = await api.fetchApi("/layout_sort/models", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ base_url: widgetValue(node, "llm_base_url", "") }),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const result = await res.json();
+        if (result.error) throw new Error(result.error);
+        const widget = modelWidget(node);
+        if (widget) {
+            widget.options = widget.options ?? {};
+            widget.options.values = [MODEL_AUTO, ...(result.models ?? [])];
+            if (!widget.options.values.includes(widget.value)) {
+                widget.value = MODEL_AUTO;
+            }
+        }
+        node.setDirtyCanvas?.(true, false);
+        toast?.add?.({
+            severity: "success",
+            summary: "Layout Sort",
+            detail: `Connected — ${result.models.length} model(s) available.`,
+            life: 4000,
+        });
+    } catch (err) {
+        console.error("[LayoutSort] connect failed:", err);
+        toast?.add?.({
+            severity: "error",
+            summary: "Layout Sort",
+            detail: `Could not list models: ${err}`,
+            life: 6000,
+        });
+    }
+}
+
 app.registerExtension({
     name: "comfyui.layout.sort",
     setup() {
@@ -294,8 +384,11 @@ app.registerExtension({
         const onNodeCreated = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function () {
             onNodeCreated?.apply(this, arguments);
+            upgradeModelWidget(this);
             // Instant sort without queueing the workflow.
             this.addWidget("button", "✨ Sort now", null, () => sortNow(this));
+            this.addWidget("button", "🔌 Connect (load models)", null,
+                () => connectModels(this));
             this.addWidget("button", KEY_BUTTON_UNSET, null, () => manageApiKey(this));
             refreshKeyStatus(this);
         };

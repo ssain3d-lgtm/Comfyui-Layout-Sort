@@ -15,11 +15,19 @@ LLM failure falls back to a plain sort.
 """
 
 import asyncio
+import functools
+import json
 import os
 import tempfile
 
 from .layout_core import compute_layout
-from .llm_client import DEFAULT_BASE_URL, is_valid_api_key, suggest_clusters
+from .llm_client import (
+    DEFAULT_BASE_URL,
+    format_origin,
+    is_valid_api_key,
+    list_models,
+    suggest_clusters,
+)
 
 WS_EVENT = "layout_sort_apply"
 LLM_TIMEOUT_SECONDS = 120
@@ -49,16 +57,42 @@ def _key_file_path():
     return os.path.join(base, ".comfyui-layout-sort", KEY_FILE_NAME)
 
 
-def load_stored_api_key():
+def load_stored_key_info():
+    """Return {"api_key": str, "allowed_origin": str|None}.
+
+    The file is JSON; a bare-string file (pre-0.5 format) is treated as a
+    key bound to no origin, i.e. loopback-only — the safe default.
+    """
     try:
         with open(_key_file_path(), "r", encoding="utf-8") as handle:
-            return handle.read().strip()
+            raw = handle.read().strip()
     except OSError:
-        return ""
+        return {"api_key": "", "allowed_origin": None}
+    if not raw:
+        return {"api_key": "", "allowed_origin": None}
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return {"api_key": raw, "allowed_origin": None}
+    if not isinstance(data, dict):
+        return {"api_key": "", "allowed_origin": None}
+    origin = data.get("allowed_origin")
+    return {
+        "api_key": str(data.get("api_key") or "").strip(),
+        "allowed_origin": str(origin) if origin else None,
+    }
 
 
-def store_api_key(key):
+def load_stored_api_key():
+    return load_stored_key_info()["api_key"]
+
+
+def store_api_key(key, allowed_origin=None):
     """Persist (or clear, for empty keys) the server-side API key.
+
+    `allowed_origin` binds the key to one non-loopback origin: it is only
+    ever attached to requests for that origin or loopback targets, so a
+    shared workflow pointing llm_base_url elsewhere cannot exfiltrate it.
 
     Raises ValueError for keys with non-printable/non-ASCII characters —
     they would corrupt the Authorization header and could echo the key
@@ -76,11 +110,12 @@ def store_api_key(key):
     directory = os.path.dirname(path)
     if directory:
         os.makedirs(directory, mode=0o700, exist_ok=True)
+    payload = json.dumps({"api_key": key, "allowed_origin": allowed_origin})
     # Create owner-only atomically (no 0644 window between open and chmod);
     # the chmod still runs to tighten a pre-existing file.
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        handle.write(key)
+        handle.write(payload)
     try:
         os.chmod(path, 0o600)
     except OSError:
@@ -98,14 +133,22 @@ def run_layout(workflow, options, llm_cfg=None):
         llm_info = {"used": False,
                     "error": 'group_mode must be "cluster" for LLM clustering'}
     elif use_llm:
-        # Priority: explicit (programmatic callers) > stored file > env var
-        # (the env fallback lives inside suggest_clusters).
+        # Priority: explicit (programmatic callers, who paired key and URL
+        # themselves) > stored file (bound to its saved origin) > env var
+        # (gated inside suggest_clusters).
+        explicit_key = (llm_cfg.get("api_key") or "").strip()
+        if explicit_key:
+            api_key, key_origin = explicit_key, "*"
+        else:
+            stored = load_stored_key_info()
+            api_key, key_origin = stored["api_key"], stored["allowed_origin"]
         clusters, error = suggest_clusters(
             workflow,
             base_url=llm_cfg.get("base_url") or DEFAULT_BASE_URL,
             model=llm_cfg.get("model") or "",
             timeout=LLM_TIMEOUT_SECONDS,
-            api_key=llm_cfg.get("api_key") or load_stored_api_key(),
+            api_key=api_key,
+            key_origin=key_origin,
         )
         if error:
             llm_info = {"used": False, "error": error}
@@ -159,16 +202,19 @@ else:
 
     def _key_status():
         from .llm_client import API_KEY_ENV_VAR
-        if load_stored_api_key():
+        stored = load_stored_key_info()
+        if stored["api_key"]:
             source = "file"
         elif os.environ.get(API_KEY_ENV_VAR, "").strip():
             source = "env"
         else:
             source = "none"
         # Status only — the key itself is never sent back to any client.
-        return web.json_response(
-            {"configured": source != "none", "source": source}
-        )
+        return web.json_response({
+            "configured": source != "none",
+            "source": source,
+            "allowed_origin": stored["allowed_origin"],
+        })
 
     async def _layout_sort_key_get(_request):
         return _key_status()
@@ -184,14 +230,37 @@ else:
         key = str(data.get("api_key") or "").strip()
         if len(key) > MAX_KEY_LENGTH:
             return web.json_response({"error": "key too long"}, status=400)
+        # Bind the key to the base_url the node pointed at when it was
+        # saved; loopback targets are always allowed regardless.
+        allowed_origin = format_origin(str(data.get("origin_hint") or ""))
         try:
-            store_api_key(key)
+            store_api_key(key, allowed_origin)
         except ValueError as exc:
             # Message is fixed text — never contains the key value.
             return web.json_response({"error": str(exc)}, status=400)
         except OSError as exc:
             return web.json_response({"error": str(exc)}, status=500)
         return _key_status()
+
+    async def _layout_sort_models(request):
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid json"}, status=400)
+        if not isinstance(data, dict):
+            return web.json_response({"error": "body must be an object"},
+                                     status=400)
+        stored = load_stored_key_info()
+        models, error = await asyncio.get_running_loop().run_in_executor(
+            None,
+            functools.partial(
+                list_models,
+                base_url=str(data.get("base_url") or ""),
+                api_key=stored["api_key"],
+                key_origin=stored["allowed_origin"],
+            ),
+        )
+        return web.json_response({"models": models, "error": error})
 
     try:
         PromptServer.instance.routes.post("/layout_sort/compute")(
@@ -202,6 +271,9 @@ else:
         )
         PromptServer.instance.routes.post("/layout_sort/api_key")(
             _layout_sort_key_set
+        )
+        PromptServer.instance.routes.post("/layout_sort/models")(
+            _layout_sort_models
         )
     except Exception as exc:  # keep the node usable even if the routes fail
         import logging
@@ -272,9 +344,11 @@ class LayoutSort:
                 ),
                 "llm_model": (
                     "STRING",
-                    {"default": "",
-                     "tooltip": "Model id to use. Leave empty to use the "
-                                "first model loaded in the server."},
+                    {"default": "auto",
+                     "tooltip": "Model to use. \"auto\" picks the first model "
+                                "loaded in the server; press the Connect "
+                                "button to list the available models and "
+                                "choose one."},
                 ),
             },
             "optional": {
@@ -322,6 +396,7 @@ class LayoutSort:
             "positions": result["positions"],
             "groups": result["groups"],
             "new_groups": result.get("new_groups") or [],
+            "reroutes": result.get("reroutes") or {},
             "llm": result.get("llm"),
             "animate": bool(animate),
             "source_node": unique_id,

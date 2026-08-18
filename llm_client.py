@@ -20,11 +20,17 @@ LOGGER = logging.getLogger("ComfyUI-Layout-Sort")
 DEFAULT_BASE_URL = "http://127.0.0.1:1234/v1"
 # Safe way to supply a token: it never gets serialized into workflows.
 API_KEY_ENV_VAR = "LAYOUT_SORT_LLM_API_KEY"
+# Origin the env-var key may be sent to (loopback is always allowed).
+ALLOWED_ORIGIN_ENV_VAR = "LAYOUT_SORT_LLM_ALLOWED_ORIGIN"
 MAX_NODES = 300
 MAX_LINKS = 800
 MAX_CLUSTERS = 12
 MAX_NAME_LENGTH = 60
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+# Thinking models (qwen3 etc.) burn output tokens inside <think> before
+# emitting the JSON answer; a small budget gets truncated mid-think and
+# looks like "reply contains no JSON".
+MAX_COMPLETION_TOKENS = 4096
 
 SYSTEM_PROMPT = (
     "You are an expert at reading ComfyUI node workflows.\n"
@@ -123,6 +129,47 @@ def _origin(url):
     return (scheme, (parts.hostname or "").lower(), port)
 
 
+def _ensure_scheme(url):
+    url = (url or "").strip()
+    if url and not re.match(r"^https?://", url, re.IGNORECASE):
+        url = "http://" + url
+    return url
+
+
+def format_origin(url):
+    """Normalize a URL to its origin string, e.g. "http://127.0.0.1:1234"."""
+    url = _ensure_scheme(url)
+    if not url:
+        return None
+    scheme, host, port = _origin(url)
+    if not host:
+        return None
+    return f"{scheme}://{host}:{port}"
+
+
+def _is_loopback_host(host):
+    return host in ("localhost", "::1") or host.startswith("127.")
+
+
+def key_allowed_for(base_url, key_origin):
+    """May a stored/ambient key be attached to a request to base_url?
+
+    key_origin semantics: "*" = always (the caller explicitly paired key
+    and URL); None = loopback targets only; an origin/URL string = that
+    origin only. Loopback targets are always allowed — the risk being
+    gated is a shared workflow pointing llm_base_url at a hostile remote
+    host to exfiltrate the server-stored key.
+    """
+    if key_origin == "*":
+        return True
+    scheme, host, port = _origin(_ensure_scheme(base_url))
+    if _is_loopback_host(host):
+        return True
+    if not key_origin:
+        return False
+    return _origin(_ensure_scheme(key_origin)) == (scheme, host, port)
+
+
 class _AuthStrippingRedirectHandler(urllib.request.HTTPRedirectHandler):
     """urllib forwards Authorization across redirects by default, so a
     hostile or compromised endpoint could 302 the request elsewhere and
@@ -168,9 +215,40 @@ def _pick_model(base_url, timeout, api_key=""):
     return str(models[0].get("id"))
 
 
+def list_models(base_url=None, timeout=15, api_key="", key_origin="*"):
+    """List model ids from the server (for the node's Connect button).
+
+    Returns (model_ids, None) or ([], error_message). The stored/ambient
+    key is attached only when `key_allowed_for` permits it.
+    """
+    base = _ensure_scheme((base_url or DEFAULT_BASE_URL).strip().rstrip("/")
+                          or DEFAULT_BASE_URL)
+    api_key = (api_key or "").strip()
+    if api_key:
+        if not key_allowed_for(base, key_origin) or not is_valid_api_key(api_key):
+            api_key = ""
+    else:
+        env_key = os.environ.get(API_KEY_ENV_VAR, "").strip()
+        env_origin = os.environ.get(ALLOWED_ORIGIN_ENV_VAR, "").strip() or None
+        if env_key and key_allowed_for(base, env_origin) and is_valid_api_key(env_key):
+            api_key = env_key
+    try:
+        data = _request_json(base + "/models", None, timeout, api_key)
+        models = [str(m.get("id")) for m in data.get("data") or []
+                  if isinstance(m, dict) and m.get("id")]
+        if not models:
+            return [], "the server reports no loaded models"
+        return models, None
+    except Exception as exc:
+        return [], f"{type(exc).__name__}: {exc}"
+
+
 def _extract_json(text):
     """Pull the first JSON object/array out of a chatty model reply."""
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.S)  # reasoning models
+    # A reply truncated mid-think has an unterminated <think> with nothing
+    # useful after it — drop it instead of feeding it to the parser.
+    text = re.sub(r"<think>.*\Z", "", text, flags=re.S)
     # Try every fenced block first, then the full text — the answer is not
     # necessarily in the first fence.
     candidates = [m.group(1) for m in re.finditer(r"```(?:json)?\s*(.*?)```", text, re.S)]
@@ -249,29 +327,76 @@ def _validate(parsed, workflow):
     return clusters
 
 
-def suggest_clusters(workflow, base_url=None, model="", timeout=60, api_key=""):
+def _parse_reply(data):
+    """Extract clusters from a chat completion, with actionable errors."""
+    choice = (data.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    content = message.get("content") or ""
+    # Some servers put a thinking model's chain-of-thought in a separate
+    # field; if content is empty the answer sometimes hides in there.
+    reasoning = message.get("reasoning_content") or message.get("reasoning") or ""
+    finish = choice.get("finish_reason")
+    for text in (content, reasoning):
+        if not text:
+            continue
+        try:
+            return _extract_json(text)
+        except ValueError:
+            continue
+    LOGGER.info("unparseable LLM reply (finish_reason=%s): %.300r",
+                finish, content or reasoning)
+    if finish == "length":
+        raise ValueError(
+            "the model hit its token limit before finishing the answer — "
+            "thinking models can spend the whole budget inside <think>; "
+            "use a non-thinking model or a bigger context/token limit"
+        )
+    raise ValueError("reply contains no JSON")
+
+
+def suggest_clusters(workflow, base_url=None, model="", timeout=60,
+                     api_key="", key_origin="*"):
     """Ask the local LLM for semantic clusters.
 
-    `api_key` is sent as a Bearer token when non-empty (LM Studio needs
-    none by default; proxies/remote servers may). Falls back to the
-    LAYOUT_SORT_LLM_API_KEY environment variable, which keeps the token
-    out of saved workflows.
+    `api_key` is sent as a Bearer token, but only when `key_allowed_for`
+    permits it for this base_url (`key_origin`: "*" = caller explicitly
+    paired key and URL; an origin string = the origin the stored key is
+    bound to; None = loopback only). With no key given, the
+    LAYOUT_SORT_LLM_API_KEY environment variable applies under the same
+    gate (its origin comes from LAYOUT_SORT_LLM_ALLOWED_ORIGIN). This
+    stops a shared workflow from pointing llm_base_url at a hostile host
+    and exfiltrating the server-stored key.
 
     Returns (clusters, None) on success or ([], error_message) on any
     failure — callers fall back to a plain sort.
     """
-    base = (base_url or DEFAULT_BASE_URL).strip().rstrip("/")
-    if not base:
-        base = DEFAULT_BASE_URL
-    if not re.match(r"^https?://", base, re.IGNORECASE):
-        base = "http://" + base
-    api_key = (api_key or "").strip() or os.environ.get(API_KEY_ENV_VAR, "").strip()
+    base = _ensure_scheme((base_url or DEFAULT_BASE_URL).strip().rstrip("/")
+                          or DEFAULT_BASE_URL)
+    withheld = False
+    api_key = (api_key or "").strip()
+    if api_key:
+        if not key_allowed_for(base, key_origin):
+            api_key = ""
+            withheld = True
+    else:
+        env_key = os.environ.get(API_KEY_ENV_VAR, "").strip()
+        if env_key:
+            env_origin = os.environ.get(ALLOWED_ORIGIN_ENV_VAR, "").strip() or None
+            if key_allowed_for(base, env_origin):
+                api_key = env_key
+            else:
+                withheld = True
+    if withheld:
+        LOGGER.info("API key withheld: %s is outside the key's allowed origin", base)
     if api_key and not is_valid_api_key(api_key):
         # Refuse before any header is built, so the key value can never
         # surface in an exception message, log line, or toast.
         return [], "the API key contains invalid characters"
+    model = (model or "").strip()
+    if model.lower() == "auto":
+        model = ""
     try:
-        model_id = (model or "").strip() or _pick_model(base, min(timeout, 15), api_key)
+        model_id = model or _pick_model(base, min(timeout, 15), api_key)
         payload = {
             "model": model_id,
             "messages": [
@@ -279,7 +404,7 @@ def suggest_clusters(workflow, base_url=None, model="", timeout=60, api_key=""):
                 {"role": "user", "content": build_digest(workflow)},
             ],
             "temperature": 0.2,
-            "max_tokens": 2048,
+            "max_tokens": MAX_COMPLETION_TOKENS,
             "response_format": RESPONSE_SCHEMA,
         }
         try:
@@ -294,13 +419,17 @@ def suggest_clusters(workflow, base_url=None, model="", timeout=60, api_key=""):
                 raise
             payload.pop("response_format", None)
             data = _request_json(base + "/chat/completions", payload, timeout, api_key)
-        content = data["choices"][0]["message"]["content"]
-        clusters = _validate(_extract_json(content), workflow)
+        clusters = _validate(_parse_reply(data), workflow)
         if not clusters:
             return [], "the model returned no usable clusters"
         LOGGER.info("LLM suggested %d clusters via %s", len(clusters), model_id)
         return clusters, None
     except Exception as exc:  # degrade to a plain sort, never break it
         message = f"{type(exc).__name__}: {exc}"
+        if withheld and isinstance(exc, urllib.error.HTTPError) \
+                and exc.code in (401, 403):
+            message += (" — the stored API key was withheld because this "
+                        "llm_base_url is outside its allowed origin; re-save "
+                        "the key while the node points at this server")
         LOGGER.warning("LLM clustering unavailable (%s)", message)
         return [], message

@@ -44,6 +44,10 @@ DEFAULT_OPTIONS = {
     "v_spacing": 40,   # gap between items inside a layer
     "group_mode": "cluster",  # or "refit"
     "barycenter_sweeps": 4,
+    # Node types whose links are ignored for layout topology. The sorter
+    # node itself belongs here: a trigger wired into it is execution-order
+    # plumbing and must not warp the layout it produces.
+    "detach_types": ("LayoutSort",),
 }
 
 GROUP_SIDE_PADDING = 24.0
@@ -91,14 +95,18 @@ def _normalize_nodes(workflow):
             "y": pos[1] - TITLE_HEIGHT,
             "w": width,
             "h": (0.0 if collapsed else max(size[1], 1.0)) + TITLE_HEIGHT,
+            "type": str(raw.get("type") or ""),
         }
     return nodes
 
 
-def _normalize_links(workflow, nodes):
+def _normalize_links(workflow, nodes, detach_types=()):
     """Return [(origin_id, target_id, target_slot)] for every valid link.
-    Endpoints match by string form too, so int/str id mixes still connect."""
+    Endpoints match by string form too, so int/str id mixes still connect.
+    Links touching a node whose type is in `detach_types` are dropped, so
+    those nodes lay out as islands instead of warping the flow."""
     by_str = {str(nid): nid for nid in nodes}
+    detach = set(detach_types or ())
     edges = []
     for raw in workflow.get("links") or []:
         if isinstance(raw, (list, tuple)) and len(raw) >= 5:
@@ -111,11 +119,14 @@ def _normalize_links(workflow, nodes):
             continue
         origin = by_str.get(str(origin))
         target = by_str.get(str(target))
-        if origin is not None and target is not None and origin != target:
-            try:
-                edges.append((origin, target, int(slot or 0)))
-            except (TypeError, ValueError):
-                edges.append((origin, target, 0))
+        if origin is None or target is None or origin == target:
+            continue
+        if nodes[origin]["type"] in detach or nodes[target]["type"] in detach:
+            continue
+        try:
+            edges.append((origin, target, int(slot or 0)))
+        except (TypeError, ValueError):
+            edges.append((origin, target, 0))
     return edges
 
 
@@ -199,8 +210,13 @@ def _assign_layers(items, edges):
     return layer, preds, succs, islands
 
 
-def _order_layers(items, layer, preds, succs, sweeps):
-    """Barycenter ordering to reduce crossings; stable on original y."""
+def _order_layers(items, layer, preds, succs, edges, sweeps):
+    """Barycenter ordering to reduce crossings; stable on original y.
+
+    The upstream (succ-driven) sweep weighs each anchor by the consumer's
+    input slot, so the several producers feeding one node stack in the
+    same top-to-bottom order as its input sockets — straighter links
+    around samplers and conditioning."""
     layers = {}
     for iid, depth in layer.items():
         layers.setdefault(depth, []).append(iid)
@@ -208,7 +224,13 @@ def _order_layers(items, layer, preds, succs, sweeps):
     for depth in depths:
         layers[depth].sort(key=lambda iid: (items[iid]["y"], items[iid]["x"]))
 
-    def sweep(order_by, neighbors):
+    pred_anchors = {iid: [(p, 0.0) for p in preds[iid]] for iid in layer}
+    succ_anchors = {}
+    for origin, target, slot in edges:
+        if origin in layer and target in layer:
+            succ_anchors.setdefault(origin, []).append((target, slot / 32.0))
+
+    def sweep(order_by, anchors_map):
         for depth in order_by:
             index = {}
             for other_depth in depths:
@@ -218,7 +240,9 @@ def _order_layers(items, layer, preds, succs, sweeps):
             current = {iid: i for i, iid in enumerate(layers[depth])}
 
             def key(iid):
-                anchors = [index[n] for n in neighbors[iid] if n in index]
+                anchors = [index[n] + weight
+                           for n, weight in anchors_map.get(iid, ())
+                           if n in index]
                 if not anchors:
                     return (float(current[iid]), items[iid]["y"])
                 return (sum(anchors) / len(anchors), items[iid]["y"])
@@ -226,8 +250,8 @@ def _order_layers(items, layer, preds, succs, sweeps):
             layers[depth].sort(key=key)
 
     for _ in range(max(0, sweeps)):
-        sweep(depths, preds)                  # top-down: follow inputs
-        sweep(list(reversed(depths)), succs)  # bottom-up: follow outputs
+        sweep(depths, pred_anchors)                  # top-down: follow inputs
+        sweep(list(reversed(depths)), succ_anchors)  # bottom-up: follow outputs
     return [layers[d] for d in depths]
 
 
@@ -300,7 +324,7 @@ def _layered_layout(items, edges, direction, h_spacing, v_spacing, sweeps):
     if not items:
         return {}, (0.0, 0.0)
     layer, preds, succs, islands = _assign_layers(items, edges)
-    ordered_layers = _order_layers(items, layer, preds, succs, sweeps)
+    ordered_layers = _order_layers(items, layer, preds, succs, edges, sweeps)
     positions, main_extent = _place_layers(
         items, ordered_layers, direction, h_spacing, v_spacing
     )
@@ -507,6 +531,102 @@ def _refit_member_groups(groups, nodes, positions):
     return updates
 
 
+def _compute_reroutes(workflow, nodes, positions):
+    """Reposition native reroute points along their link's new path.
+
+    ComfyUI serializes reroutes under extra.reroutes (0.4 format, with
+    link parents in extra.linkExtensions) or top-level reroutes (schema
+    v1, parentId on the link object). A link's parentId names the reroute
+    closest to the TARGET; each reroute's parentId walks toward the
+    ORIGIN. Reroutes in a chain are spread evenly along the straight
+    segment between the two moved nodes; a reroute shared by several
+    links (fan-out) keeps the position given by its first link.
+
+    Returns {reroute_id: [x, y]} in the same relative visual space as
+    `positions`. Unresolvable reroutes are left out (and thus untouched).
+    """
+    extra = workflow.get("extra") or {}
+    raw_reroutes = workflow.get("reroutes") or extra.get("reroutes") or []
+    if not isinstance(raw_reroutes, list) or not raw_reroutes:
+        return {}
+    reroutes = {}
+    for raw in raw_reroutes:
+        if isinstance(raw, dict) and raw.get("id") is not None:
+            reroutes[raw["id"]] = raw
+
+    by_str = {str(nid): nid for nid in nodes}
+    link_ends = {}
+    link_parent = {}
+    for raw in workflow.get("links") or []:
+        if isinstance(raw, (list, tuple)) and len(raw) >= 5:
+            link_id, origin, target = raw[0], raw[1], raw[3]
+        elif isinstance(raw, dict):
+            link_id = raw.get("id")
+            origin, target = raw.get("origin_id"), raw.get("target_id")
+            if raw.get("parentId") is not None:
+                link_parent[link_id] = raw["parentId"]
+        else:
+            continue
+        origin = by_str.get(str(origin))
+        target = by_str.get(str(target))
+        if link_id is not None and origin is not None and target is not None:
+            link_ends[link_id] = (origin, target)
+    for ext in extra.get("linkExtensions") or []:
+        if (isinstance(ext, dict) and ext.get("id") is not None
+                and ext.get("parentId") is not None):
+            link_parent[ext["id"]] = ext["parentId"]
+
+    def port_points(link_id):
+        origin, target = link_ends[link_id]
+        if origin not in positions or target not in positions:
+            return None
+        o_node, t_node = nodes[origin], nodes[target]
+        return (
+            (positions[origin][0] + o_node["w"],
+             positions[origin][1] + o_node["h"] / 2.0),
+            (positions[target][0],
+             positions[target][1] + t_node["h"] / 2.0),
+        )
+
+    def chain_toward_origin(terminal_id):
+        chain = []
+        cursor = terminal_id
+        while cursor is not None and cursor in reroutes and len(chain) < 128:
+            chain.append(cursor)
+            cursor = reroutes[cursor].get("parentId")
+        chain.reverse()  # origin -> target order
+        return chain
+
+    placed = {}
+
+    def place_chain(chain, link_id):
+        points = port_points(link_id)
+        if not points:
+            return
+        (ox, oy), (tx, ty) = points
+        count = len(chain)
+        for i, rid in enumerate(chain):
+            if rid in placed:
+                continue  # shared trunk: first link's placement wins
+            fraction = (i + 1.0) / (count + 1.0)
+            placed[rid] = [ox + (tx - ox) * fraction,
+                           oy + (ty - oy) * fraction]
+
+    for link_id in sorted(link_parent, key=str):
+        if link_id in link_ends:
+            place_chain(chain_toward_origin(link_parent[link_id]), link_id)
+    # Fallback for reroutes with no linkExtensions entry: place each along
+    # the first of its own linkIds.
+    for rid, raw in reroutes.items():
+        if rid in placed:
+            continue
+        for link_id in raw.get("linkIds") or []:
+            if link_id in link_ends:
+                place_chain([rid], link_id)
+                break
+    return placed
+
+
 def _park_stale_groups(groups, framed_indices, occupied_rects, v_spacing):
     """Groups that ended up with no content get no computed frame; left in
     place they could sit on top of the re-packed layout (and dragging them
@@ -538,8 +658,10 @@ def compute_layout(workflow, options=None, extra_clusters=None):
 
     Returns {"positions": {node_id: [x, y]},
              "groups": [{"index", "bounding"}],
-             "new_groups": [{"title", "bounding"}]}.
-    Positions use LiteGraph semantics (top of the node body).
+             "new_groups": [{"title", "bounding"}],
+             "reroutes": {reroute_id: [x, y]}}.
+    Positions use LiteGraph semantics (top of the node body); reroute
+    positions are plain canvas points.
     """
     opts = dict(DEFAULT_OPTIONS)
     if options:
@@ -552,8 +674,8 @@ def compute_layout(workflow, options=None, extra_clusters=None):
 
     nodes = _normalize_nodes(workflow)
     if not nodes:
-        return {"positions": {}, "groups": [], "new_groups": []}
-    edges = _normalize_links(workflow, nodes)
+        return {"positions": {}, "groups": [], "new_groups": [], "reroutes": {}}
+    edges = _normalize_links(workflow, nodes, opts.get("detach_types") or ())
     groups = _normalize_groups(workflow)
     synthetic_start = len(workflow.get("groups") or [])
 
@@ -574,6 +696,7 @@ def compute_layout(workflow, options=None, extra_clusters=None):
     group_updates += _park_stale_groups(
         groups, {u["index"] for u in group_updates}, occupied, v_spacing
     )
+    reroutes = _compute_reroutes(workflow, nodes, positions)
 
     # Anchor the new layout at the old graph's visual top-left so the
     # canvas view doesn't jump to a different region, and convert visual
@@ -602,4 +725,8 @@ def compute_layout(workflow, options=None, extra_clusters=None):
             }
             for u in group_updates if u["index"] >= synthetic_start
         ],
+        "reroutes": {
+            str(rid): [origin_x + p[0], origin_y + p[1]]
+            for rid, p in reroutes.items()
+        },
     }

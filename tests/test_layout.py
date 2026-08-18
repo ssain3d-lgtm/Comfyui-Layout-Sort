@@ -216,8 +216,84 @@ assert parked[1] >= node_bottom, "parked frame must sit below the layout"
 assert (parked[2], parked[3]) == (240, 120), "parked frame keeps its size"
 print("stale group parking OK")
 
+# ---------------------------- LayoutSort trigger must not warp the layout
+wf = {"nodes": list(BASE["nodes"]),
+      "links": list(BASE["links"]) + [[99, 9, 0, 11, 0, "*"]]}  # 9 -> LayoutSort
+result = compute_layout(wf, {"group_mode": "refit"})
+pos = {int(k): v for k, v in result["positions"].items()}
+check_flow_lr(pos, BASE["links"])          # real links still flow left-right
+main_bottom = max(visual_rect(n, pos)[1] + visual_rect(n, pos)[3] for n in FLOW_IDS)
+assert pos[11][1] - TITLE_HEIGHT >= main_bottom, \
+    "LayoutSort with a trigger link must stay an island below the flow"
+print("detach LayoutSort OK")
+
+# -------------------------- upstream nodes follow their consumer's slots
+slot_wf = {
+    "nodes": [
+        node(1, "A", [0, 300], [200, 80]),   # feeds slot 2
+        node(2, "B", [0, 0], [200, 80]),     # feeds slot 0
+        node(3, "C", [0, 600], [200, 80]),   # feeds slot 1
+        node(4, "D", [400, 300], [200, 200]),
+    ],
+    "links": [
+        [1, 1, 0, 4, 2, "X"],
+        [2, 2, 0, 4, 0, "X"],
+        [3, 3, 0, 4, 1, "X"],
+    ],
+}
+result = compute_layout(slot_wf)
+pos = {int(k): v for k, v in result["positions"].items()}
+assert pos[2][1] < pos[3][1] < pos[1][1], \
+    f"producers must stack in input-slot order (B,C,A): {pos}"
+print("slot ordering OK")
+
+# ------------------------------------------- reroutes follow their links
+def check_reroute_chain(result, pos_key_a=1, pos_key_b=2):
+    pos = {int(k): v for k, v in result["positions"].items()}
+    rr = {int(k): v for k, v in result["reroutes"].items()}
+    assert set(rr) == {1, 2}, f"both reroutes must be placed: {rr}"
+    a_right = pos[pos_key_a][0] + 200
+    b_left = pos[pos_key_b][0]
+    assert a_right <= rr[1][0] < rr[2][0] <= b_left, \
+        f"chain must run origin->target between the nodes: {rr}"
+    # both points sit on the straight segment between the two port centers
+    ay = pos[pos_key_a][1] - TITLE_HEIGHT + (80 + TITLE_HEIGHT) / 2
+    by = pos[pos_key_b][1] - TITLE_HEIGHT + (80 + TITLE_HEIGHT) / 2
+    for rid in (1, 2):
+        frac = (rr[rid][0] - a_right) / max(b_left - a_right, 1e-6)
+        expected_y = ay + (by - ay) * frac
+        assert abs(rr[rid][1] - expected_y) < 1e-6, (rid, rr[rid], expected_y)
+
+# 0.4 format: extra.reroutes + extra.linkExtensions
+wf_04 = {
+    "nodes": [node(1, "A", [0, 0], [200, 80]), node(2, "B", [900, 500], [200, 80])],
+    "links": [[5, 1, 0, 2, 0, "X"]],
+    "extra": {
+        "reroutes": [
+            {"id": 1, "pos": [400, 300], "linkIds": [5]},
+            {"id": 2, "parentId": 1, "pos": [600, 400], "linkIds": [5]},
+        ],
+        "linkExtensions": [{"id": 5, "parentId": 2}],
+    },
+}
+check_reroute_chain(compute_layout(wf_04))
+
+# schema v1: top-level reroutes + object links carrying parentId
+wf_v1 = {
+    "nodes": [node(1, "A", [0, 0], [200, 80]), node(2, "B", [900, 500], [200, 80])],
+    "links": [{"id": 5, "origin_id": 1, "origin_slot": 0,
+               "target_id": 2, "target_slot": 0, "type": "X", "parentId": 2}],
+    "reroutes": [
+        {"id": 1, "pos": [400, 300], "linkIds": [5]},
+        {"id": 2, "parentId": 1, "pos": [600, 400], "linkIds": [5]},
+    ],
+}
+check_reroute_chain(compute_layout(wf_v1))
+print("reroutes OK")
+
 # ---------------------------------------------------------------- degenerate
-assert compute_layout({}) == {"positions": {}, "groups": [], "new_groups": []}
+assert compute_layout({}) == {"positions": {}, "groups": [],
+                              "new_groups": [], "reroutes": {}}
 assert compute_layout({"nodes": [], "links": None})["positions"] == {}
 compute_layout({"nodes": [node(1, "Solo", {"0": 5, "1": 6}, {"0": 100, "1": 50})],
                 "links": [{"origin_id": 1, "target_id": 1}],
