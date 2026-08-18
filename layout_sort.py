@@ -65,13 +65,19 @@ def run_layout(workflow, options, llm_cfg=None):
 try:
     from server import PromptServer
     from aiohttp import web
-
-    @PromptServer.instance.routes.post("/layout_sort/compute")
+except ImportError:
+    # Imported outside a running ComfyUI (e.g. unit tests): the node class
+    # is still importable, only the live push/route are unavailable.
+    PromptServer = None
+else:
     async def _layout_sort_compute(request):
         try:
             data = await request.json()
         except Exception:
             return web.json_response({"error": "invalid json"}, status=400)
+        if not isinstance(data, dict):
+            return web.json_response({"error": "body must be an object"},
+                                     status=400)
         workflow = data.get("workflow") or {}
         options = data.get("options") or {}
         llm_cfg = data.get("llm") or {}
@@ -84,10 +90,15 @@ try:
             return web.json_response({"error": str(exc)}, status=500)
         return web.json_response(result)
 
-except ImportError:
-    # Imported outside a running ComfyUI (e.g. unit tests): the node class
-    # is still importable, only the live push/route are unavailable.
-    PromptServer = None
+    try:
+        PromptServer.instance.routes.post("/layout_sort/compute")(
+            _layout_sort_compute
+        )
+    except Exception as exc:  # keep the node usable even if the route fails
+        import logging
+        logging.getLogger("ComfyUI-Layout-Sort").warning(
+            "could not register /layout_sort/compute: %s", exc
+        )
 
 
 class AnyType(str):
@@ -179,7 +190,8 @@ class LayoutSort:
              llm_clustering, llm_base_url, llm_model,
              trigger=None, extra_pnginfo=None, unique_id=None):
         workflow = (extra_pnginfo or {}).get("workflow")
-        if not workflow or PromptServer is None:
+        server = getattr(PromptServer, "instance", None) if PromptServer else None
+        if not workflow or server is None:
             return {}
         result = run_layout(
             workflow,
@@ -196,8 +208,8 @@ class LayoutSort:
             },
         )
         # Target the client that queued this prompt; fall back to broadcast.
-        sid = getattr(PromptServer.instance, "client_id", None)
-        PromptServer.instance.send_sync(WS_EVENT, {
+        sid = getattr(server, "client_id", None)
+        server.send_sync(WS_EVENT, {
             "positions": result["positions"],
             "groups": result["groups"],
             "new_groups": result.get("new_groups") or [],

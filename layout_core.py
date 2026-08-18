@@ -29,9 +29,14 @@ drawn, title bar included); conversion to LiteGraph `pos` semantics
 (top of the node body) happens only in compute_layout's final step.
 """
 
+import math
+
 # LiteGraph draws the title bar above node.pos, so a node's visual top is
 # pos[1] - TITLE_HEIGHT and its visual height is size[1] + TITLE_HEIGHT.
 TITLE_HEIGHT = 30.0
+
+# LiteGraph renders collapsed nodes at roughly title width, not full width.
+COLLAPSED_MAX_WIDTH = 160.0
 
 DEFAULT_OPTIONS = {
     "direction": "left_to_right",  # or "top_to_bottom"
@@ -45,12 +50,24 @@ GROUP_SIDE_PADDING = 24.0
 GROUP_TITLE_PADDING = 40.0
 
 
+def _finite(value, default=0.0):
+    """float() that never lets NaN/inf (a known ComfyUI corruption mode)
+    poison the layout — one NaN would otherwise spread through min()/sums
+    into every coordinate and produce JSON the browser cannot parse."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    return number if math.isfinite(number) else float(default)
+
+
 def _xy(value, default=(0.0, 0.0)):
     """Read an [x, y]-like value that may be a list or a {"0":..,"1":..} dict."""
     if isinstance(value, (list, tuple)) and len(value) >= 2:
-        return [float(value[0]), float(value[1])]
+        return [_finite(value[0], default[0]), _finite(value[1], default[1])]
     if isinstance(value, dict):
-        return [float(value.get("0", default[0])), float(value.get("1", default[1]))]
+        return [_finite(value.get("0", default[0]), default[0]),
+                _finite(value.get("1", default[1]), default[1])]
     return [float(default[0]), float(default[1])]
 
 
@@ -65,18 +82,23 @@ def _normalize_nodes(workflow):
         pos = _xy(raw.get("pos"))
         size = _xy(raw.get("size"), (140.0, 60.0))
         flags = raw.get("flags") or {}
-        body_height = 0.0 if flags.get("collapsed") else max(size[1], 1.0)
+        collapsed = bool(flags.get("collapsed"))
+        width = max(size[0], 1.0)
+        if collapsed:
+            width = min(width, COLLAPSED_MAX_WIDTH)
         nodes[node_id] = {
             "x": pos[0],
             "y": pos[1] - TITLE_HEIGHT,
-            "w": max(size[0], 1.0),
-            "h": body_height + TITLE_HEIGHT,
+            "w": width,
+            "h": (0.0 if collapsed else max(size[1], 1.0)) + TITLE_HEIGHT,
         }
     return nodes
 
 
 def _normalize_links(workflow, nodes):
-    """Return [(origin_id, target_id, target_slot)] for every valid link."""
+    """Return [(origin_id, target_id, target_slot)] for every valid link.
+    Endpoints match by string form too, so int/str id mixes still connect."""
+    by_str = {str(nid): nid for nid in nodes}
     edges = []
     for raw in workflow.get("links") or []:
         if isinstance(raw, (list, tuple)) and len(raw) >= 5:
@@ -87,7 +109,9 @@ def _normalize_links(workflow, nodes):
             slot = raw.get("target_slot", 0)
         else:
             continue
-        if origin in nodes and target in nodes and origin != target:
+        origin = by_str.get(str(origin))
+        target = by_str.get(str(target))
+        if origin is not None and target is not None and origin != target:
             try:
                 edges.append((origin, target, int(slot or 0)))
             except (TypeError, ValueError):
@@ -106,6 +130,8 @@ def _normalize_groups(workflow):
         try:
             x, y, w, h = (float(v) for v in bounding[:4])
         except (TypeError, ValueError):
+            continue
+        if not all(math.isfinite(v) for v in (x, y, w, h)):
             continue
         groups.append({"index": index, "x": x, "y": y, "w": max(w, 1.0), "h": max(h, 1.0)})
     return groups
@@ -479,6 +505,24 @@ def _refit_member_groups(groups, nodes, positions):
     return updates
 
 
+def _park_stale_groups(groups, framed_indices, occupied_rects, v_spacing):
+    """Groups that ended up with no content get no computed frame; left in
+    place they could sit on top of the re-packed layout (and dragging them
+    would grab unrelated nodes, since LiteGraph membership is geometric).
+    Park them, at their original size, in a row below everything."""
+    stale = [g for g in groups if g["index"] not in framed_indices]
+    if not stale or not occupied_rects:
+        return []
+    x = min(r[0] for r in occupied_rects)
+    y = max(r[1] + r[3] for r in occupied_rects) + GROUP_TITLE_PADDING * 2.0
+    parked = []
+    for group in sorted(stale, key=lambda g: (g["y"], g["x"])):
+        parked.append({"index": group["index"],
+                       "bounding": [x, y, group["w"], group["h"]]})
+        x += group["w"] + v_spacing
+    return parked
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -500,9 +544,9 @@ def compute_layout(workflow, options=None, extra_clusters=None):
         opts.update({k: v for k, v in options.items() if v is not None})
     direction = opts.get("direction") or "left_to_right"
     group_mode = opts.get("group_mode") or "cluster"
-    h_spacing = max(10.0, float(opts.get("h_spacing", 80)))
-    v_spacing = max(10.0, float(opts.get("v_spacing", 40)))
-    sweeps = int(opts.get("barycenter_sweeps", 4))
+    h_spacing = max(10.0, _finite(opts.get("h_spacing", 80), 80))
+    v_spacing = max(10.0, _finite(opts.get("v_spacing", 40), 40))
+    sweeps = int(_finite(opts.get("barycenter_sweeps", 4), 4))
 
     nodes = _normalize_nodes(workflow)
     if not nodes:
@@ -521,6 +565,13 @@ def compute_layout(workflow, options=None, extra_clusters=None):
             nodes, edges, direction, h_spacing, v_spacing, sweeps
         )
         group_updates = _refit_member_groups(groups, nodes, positions)
+
+    occupied = [(p[0], p[1], nodes[nid]["w"], nodes[nid]["h"])
+                for nid, p in positions.items()]
+    occupied += [tuple(u["bounding"]) for u in group_updates]
+    group_updates += _park_stale_groups(
+        groups, {u["index"] for u in group_updates}, occupied, v_spacing
+    )
 
     # Anchor the new layout at the old graph's visual top-left so the
     # canvas view doesn't jump to a different region, and convert visual

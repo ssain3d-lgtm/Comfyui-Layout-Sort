@@ -20,6 +20,7 @@ MAX_NODES = 300
 MAX_LINKS = 800
 MAX_CLUSTERS = 12
 MAX_NAME_LENGTH = 60
+MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 
 SYSTEM_PROMPT = (
     "You are an expert at reading ComfyUI node workflows.\n"
@@ -48,7 +49,9 @@ RESPONSE_SCHEMA = {
                         "type": "object",
                         "properties": {
                             "name": {"type": "string"},
-                            "node_ids": {"type": "array", "items": {"type": "integer"}},
+                            # ids can be UUID strings in subgraph-era graphs
+                            "node_ids": {"type": "array",
+                                         "items": {"type": ["integer", "string"]}},
                         },
                         "required": ["name", "node_ids"],
                     },
@@ -113,7 +116,10 @@ def _request_json(url, payload, timeout):
         method="POST" if data is not None else "GET",
     )
     with opener.open(request, timeout=timeout) as response:
-        return json.loads(response.read().decode("utf-8", "replace"))
+        raw = response.read(MAX_RESPONSE_BYTES + 1)
+        if len(raw) > MAX_RESPONSE_BYTES:
+            raise RuntimeError("LLM response exceeds the size limit")
+        return json.loads(raw.decode("utf-8", "replace"))
 
 
 def _pick_model(base_url, timeout):
@@ -127,10 +133,20 @@ def _pick_model(base_url, timeout):
 def _extract_json(text):
     """Pull the first JSON object/array out of a chatty model reply."""
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.S)  # reasoning models
-    fenced = re.search(r"```(?:json)?\s*(.*?)```", text, re.S)
-    if fenced:
-        text = fenced.group(1)
-    text = text.strip()
+    # Try every fenced block first, then the full text — the answer is not
+    # necessarily in the first fence.
+    candidates = [m.group(1) for m in re.finditer(r"```(?:json)?\s*(.*?)```", text, re.S)]
+    candidates.append(text)
+    last_error = None
+    for candidate in candidates:
+        try:
+            return _parse_first_json(candidate.strip())
+        except ValueError as error:
+            last_error = error
+    raise last_error or ValueError("reply contains no JSON")
+
+
+def _parse_first_json(text):
     try:
         return json.loads(text)
     except ValueError:
@@ -204,7 +220,7 @@ def suggest_clusters(workflow, base_url=None, model="", timeout=60):
     base = (base_url or DEFAULT_BASE_URL).strip().rstrip("/")
     if not base:
         base = DEFAULT_BASE_URL
-    if not base.startswith(("http://", "https://")):
+    if not re.match(r"^https?://", base, re.IGNORECASE):
         base = "http://" + base
     try:
         model_id = (model or "").strip() or _pick_model(base, min(timeout, 15))
@@ -220,8 +236,14 @@ def suggest_clusters(workflow, base_url=None, model="", timeout=60):
         }
         try:
             data = _request_json(base + "/chat/completions", payload, timeout)
-        except urllib.error.HTTPError:
-            # Some models/servers reject structured output; retry plain.
+        except urllib.error.HTTPError as error:
+            # Some models/servers reject structured output with a 400;
+            # retry plain then. Other statuses (404/401/500...) would fail
+            # identically on retry, so surface them immediately.
+            code = error.code
+            error.close()
+            if code != 400:
+                raise
             payload.pop("response_format", None)
             data = _request_json(base + "/chat/completions", payload, timeout)
         content = data["choices"][0]["message"]["content"]

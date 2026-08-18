@@ -1,0 +1,454 @@
+#!/usr/bin/env python3
+"""End-to-end tests for the Comfyui-Layout-Sort LLM clustering path.
+
+Starts a mock OpenAI-compatible server (http.server on 127.0.0.1, port 0)
+and drives llm_client.suggest_clusters and layout_sort.run_layout through
+happy paths, validation edge cases, error handling, the structured-output
+fallback, and the "real user groups always win" rule.
+
+Read-only with respect to the package repo; run with python3.
+"""
+
+import importlib.util
+import json
+import socket
+import sys
+import threading
+import time
+import traceback
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import os
+
+PKG_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PKG_INIT = os.path.join(PKG_DIR, "__init__.py")
+
+# --- import the package the way ComfyUI does (relative imports inside) ------
+spec = importlib.util.spec_from_file_location(
+    "Comfyui-Layout-Sort", PKG_INIT, submodule_search_locations=[PKG_DIR])
+mod = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = mod
+spec.loader.exec_module(mod)
+layout_sort = sys.modules["Comfyui-Layout-Sort.layout_sort"]
+llm_client = sys.modules["Comfyui-Layout-Sort.llm_client"]
+
+TITLE_HEIGHT = 30.0
+
+
+# ---------------------------------------------------------------------------
+# Mock OpenAI-compatible server
+# ---------------------------------------------------------------------------
+
+class MockLLMServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.lock = threading.Lock()
+        self.reset()
+
+    def reset(self):
+        with getattr(self, "lock", threading.Lock()):
+            self.requests = []           # [{"method","path","body","raw"}]
+            self.chat_content = "{}"     # message.content returned on success
+            self.fail_on_response_format = False  # 400 any POST containing it
+
+    def record(self, method, path, body, raw):
+        with self.lock:
+            self.requests.append(
+                {"method": method, "path": path, "body": body, "raw": raw})
+
+    def snapshot(self):
+        with self.lock:
+            return list(self.requests)
+
+
+class MockLLMHandler(BaseHTTPRequestHandler):
+    server_version = "MockLLM/1.0"
+
+    def log_message(self, *_args):  # silence request logging
+        pass
+
+    def _send(self, status, obj):
+        body = json.dumps(obj).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        self.server.record("GET", self.path, None, "")
+        if self.path == "/v1/models":
+            self._send(200, {"data": [{"id": "qwen-test"}]})
+        else:
+            self._send(404, {"error": "not found"})
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(length).decode("utf-8", "replace")
+        try:
+            body = json.loads(raw)
+        except ValueError:
+            body = None
+        self.server.record("POST", self.path, body, raw)
+        if self.path != "/v1/chat/completions":
+            self._send(404, {"error": "not found"})
+            return
+        has_rf = (isinstance(body, dict) and "response_format" in body) \
+            or "response_format" in raw
+        if self.server.fail_on_response_format and has_rf:
+            self._send(400, {"error": {
+                "message": "response_format is not supported by this model"}})
+            return
+        self._send(200, {
+            "id": "chatcmpl-mock",
+            "object": "chat.completion",
+            "model": (body or {}).get("model", "?"),
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant",
+                            "content": self.server.chat_content},
+                "finish_reason": "stop",
+            }],
+        })
+
+
+SERVER = None
+BASE = None  # e.g. http://127.0.0.1:PORT/v1
+
+
+# ---------------------------------------------------------------------------
+# Fixtures + geometry helpers
+# ---------------------------------------------------------------------------
+
+def make_workflow(with_group=False):
+    """~8-node txt2img-ish graph, ComfyUI array-form links."""
+    nodes = [
+        {"id": 4, "type": "CheckpointLoaderSimple", "pos": [100, 200],
+         "size": [315, 98], "flags": {}},
+        {"id": 10, "type": "VAELoader", "pos": [120, 400],
+         "size": [315, 126], "flags": {}},
+        {"id": 6, "type": "CLIPTextEncode", "pos": [500, 200],
+         "size": [400, 200], "flags": {}},
+        {"id": 7, "type": "CLIPTextEncode", "pos": [500, 500],
+         "size": [400, 200], "flags": {}},
+        {"id": 5, "type": "EmptyLatentImage", "pos": [520, 800],
+         "size": [315, 106], "flags": {}},
+        {"id": 3, "type": "KSampler", "pos": [1000, 300],
+         "size": [315, 262], "flags": {}},
+        {"id": 8, "type": "VAEDecode", "pos": [1400, 300],
+         "size": [210, 46], "flags": {}},
+        {"id": 9, "type": "SaveImage", "pos": [1700, 300],
+         "size": [315, 270], "flags": {}},
+    ]
+    links = [
+        # [link_id, origin, origin_slot, target, target_slot, "TYPE"]
+        [1, 4, 0, 3, 0, "MODEL"],
+        [2, 4, 1, 6, 0, "CLIP"],
+        [3, 4, 1, 7, 0, "CLIP"],
+        [4, 6, 0, 3, 1, "CONDITIONING"],
+        [5, 7, 0, 3, 2, "CONDITIONING"],
+        [6, 5, 0, 3, 3, "LATENT"],
+        [7, 3, 0, 8, 0, "LATENT"],
+        [8, 10, 0, 8, 1, "VAE"],
+        [9, 8, 0, 9, 0, "IMAGE"],
+    ]
+    wf = {"nodes": nodes, "links": links, "groups": []}
+    if with_group:
+        # Geometrically contains the visual centers of nodes 4 (257.5, 234)
+        # and 10 (277.5, 448) and of no other node.
+        wf["groups"] = [{"title": "My Loaders",
+                        "bounding": [50, 100, 500, 500]}]
+    return wf
+
+
+def node_map(wf):
+    return {n["id"]: n for n in wf["nodes"]}
+
+
+def visual_rect(node, pos):
+    """Visual rect (x, y, w, h) from a returned LiteGraph pos [px, py]."""
+    w = max(float(node["size"][0]), 1.0)
+    collapsed = bool((node.get("flags") or {}).get("collapsed"))
+    body = 0.0 if collapsed else max(float(node["size"][1]), 1.0)
+    return (float(pos[0]), float(pos[1]) - TITLE_HEIGHT, w, body + TITLE_HEIGHT)
+
+
+def rect_inside(rect, bounding, eps=1e-6):
+    x, y, w, h = rect
+    bx, by, bw, bh = bounding
+    return (bx - eps <= x and by - eps <= y
+            and x + w <= bx + bw + eps and y + h <= by + bh + eps)
+
+
+def center_inside(rect, bounding):
+    x, y, w, h = rect
+    bx, by, bw, bh = bounding
+    cx, cy = x + w / 2.0, y + h / 2.0
+    return bx <= cx <= bx + bw and by <= cy <= by + bh
+
+
+CONTENT_HAPPY = (
+    "<think>reasoning... 4 and 10 load models, 3 samples from latent 5, "
+    "so I will group by function.</think>\n"
+    "Sure! Here are the clusters:\n"
+    "```json\n"
+    '{"clusters": [{"name": "Loaders", "node_ids": [4, 10]}, '
+    '{"name": "Sampling", "node_ids": [3, 5]}]}\n'
+    "```\n"
+    "Let me know if you need anything else."
+)
+
+
+# ---------------------------------------------------------------------------
+# Cases
+# ---------------------------------------------------------------------------
+
+CASES = []
+
+
+def case(name):
+    def wrap(fn):
+        CASES.append((name, fn))
+        return fn
+    return wrap
+
+
+@case("1. happy path: think-block + fenced JSON, auto-picked model")
+def case_happy_path():
+    SERVER.chat_content = CONTENT_HAPPY
+    clusters, err = llm_client.suggest_clusters(
+        make_workflow(), base_url=BASE, model="", timeout=30)
+    assert err is None, f"expected no error, got: {err!r}"
+    assert clusters == [
+        {"name": "Loaders", "node_ids": [4, 10]},
+        {"name": "Sampling", "node_ids": [3, 5]},
+    ], f"unexpected clusters: {clusters!r}"
+
+    reqs = SERVER.snapshot()
+    gets = [r for r in reqs if r["method"] == "GET"]
+    posts = [r for r in reqs if r["method"] == "POST"]
+    assert any(g["path"] == "/v1/models" for g in gets), \
+        f"model auto-pick never hit GET /v1/models: {gets!r}"
+    assert len(posts) == 1 and posts[0]["path"] == "/v1/chat/completions", \
+        f"expected exactly one chat POST, got: {[p['path'] for p in posts]!r}"
+    body = posts[0]["body"]
+    assert body["model"] == "qwen-test", \
+        f"auto-picked model not sent in POST body: {body.get('model')!r}"
+    assert "response_format" in body, "first attempt should send response_format"
+    assert body["messages"][0]["role"] == "system"
+    assert "NODES" in body["messages"][1]["content"], "digest missing from user msg"
+
+
+@case("2. validation: unknown id, singleton, duplicate (first wins), string id")
+def case_validation():
+    long_name = "L" * 75
+    SERVER.chat_content = json.dumps({"clusters": [
+        {"name": long_name, "node_ids": [4, 999, 10]},   # 999 unknown
+        {"name": "Decode", "node_ids": [4, 8, 9]},        # 4 already taken
+        {"name": "", "node_ids": ["3", 5]},               # "3" matches int 3
+        {"name": "Solo", "node_ids": [6]},                # singleton -> dropped
+    ]})
+    clusters, err = llm_client.suggest_clusters(
+        make_workflow(), base_url=BASE, model="", timeout=30)
+    assert err is None, f"expected no error, got: {err!r}"
+    assert clusters == [
+        {"name": "L" * 60, "node_ids": [4, 10]},          # truncated to 60
+        {"name": "Decode", "node_ids": [8, 9]},           # 4 kept by cluster 1
+        {"name": "Cluster 3", "node_ids": [3, 5]},        # name fallback
+    ], f"unexpected cleaned clusters: {clusters!r}"
+
+
+@case("3. garbage content (no JSON) -> ([], error)")
+def case_garbage():
+    SERVER.chat_content = "I could not figure out any grouping, sorry!"
+    clusters, err = llm_client.suggest_clusters(
+        make_workflow(), base_url=BASE, model="", timeout=30)
+    assert clusters == [], f"expected no clusters, got: {clusters!r}"
+    assert isinstance(err, str) and err.strip(), \
+        f"expected non-empty error message, got: {err!r}"
+
+
+@case("4. dead server -> ([], error) and returns quickly")
+def case_dead_server():
+    # Grab a port that is definitely closed right now.
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.bind(("127.0.0.1", 0))
+    dead_port = probe.getsockname()[1]
+    probe.close()
+
+    start = time.monotonic()
+    clusters, err = llm_client.suggest_clusters(
+        make_workflow(), base_url=f"http://127.0.0.1:{dead_port}/v1",
+        model="", timeout=8)
+    elapsed = time.monotonic() - start
+    assert clusters == [], f"expected no clusters, got: {clusters!r}"
+    assert isinstance(err, str) and err.strip(), \
+        f"expected non-empty error, got: {err!r}"
+    assert elapsed < 10.0, f"dead-server failure took {elapsed:.1f}s (>= 10s)"
+
+
+@case("5. structured-output 400 -> retry without response_format succeeds")
+def case_response_format_fallback():
+    SERVER.chat_content = CONTENT_HAPPY
+    SERVER.fail_on_response_format = True
+    clusters, err = llm_client.suggest_clusters(
+        make_workflow(), base_url=BASE, model="", timeout=30)
+    assert err is None, f"expected success via retry, got error: {err!r}"
+    assert [c["name"] for c in clusters] == ["Loaders", "Sampling"], \
+        f"unexpected clusters after retry: {clusters!r}"
+
+    posts = [r for r in SERVER.snapshot()
+             if r["method"] == "POST" and r["path"] == "/v1/chat/completions"]
+    assert len(posts) == 2, f"expected 2 POST attempts, got {len(posts)}"
+    assert "response_format" in posts[0]["body"], "first POST lost response_format"
+    assert "response_format" not in posts[1]["body"], \
+        "retry still contained response_format"
+
+
+@case("6. run_layout, no real groups -> 2 named new_groups containing members")
+def case_run_layout_new_groups():
+    SERVER.chat_content = CONTENT_HAPPY
+    wf = make_workflow()
+    res = layout_sort.run_layout(
+        wf, {}, {"enabled": True, "base_url": BASE, "model": ""})
+
+    assert res["llm"]["used"] is True, f"llm info: {res.get('llm')!r}"
+    assert res["groups"] == [], f"expected no real-group updates: {res['groups']!r}"
+    assert set(res["positions"].keys()) == {str(n["id"]) for n in wf["nodes"]}, \
+        f"positions keys wrong: {sorted(res['positions'])!r}"
+
+    ng = res["new_groups"]
+    assert [g["title"] for g in ng] == ["Loaders", "Sampling"], \
+        f"unexpected new_groups: {ng!r}"
+    by_title = {g["title"]: g["bounding"] for g in ng}
+    nodes = node_map(wf)
+    for title, members in (("Loaders", [4, 10]), ("Sampling", [3, 5])):
+        bounding = by_title[title]
+        for nid in members:
+            rect = visual_rect(nodes[nid], res["positions"][str(nid)])
+            assert rect_inside(rect, bounding), (
+                f"node {nid} visual rect {rect} not inside new group "
+                f"{title!r} bounding {bounding}")
+    # Unclustered nodes must not sit inside any synthetic frame.
+    for nid in (6, 7, 8, 9):
+        rect = visual_rect(nodes[nid], res["positions"][str(nid)])
+        for title, bounding in by_title.items():
+            assert not center_inside(rect, bounding), (
+                f"unclustered node {nid} landed inside new group {title!r}")
+
+
+@case("7. user groups win: real group keeps its nodes, cluster shrinks/drops")
+def case_user_groups_win():
+    SERVER.chat_content = CONTENT_HAPPY  # LLM claims [4,10] and [3,5]
+    wf = make_workflow(with_group=True)  # real group already holds 4 and 10
+    res = layout_sort.run_layout(
+        wf, {}, {"enabled": True, "base_url": BASE, "model": ""})
+
+    assert res["llm"]["used"] is True, f"llm info: {res.get('llm')!r}"
+
+    groups = res["groups"]
+    assert len(groups) == 1 and groups[0]["index"] == 0, \
+        f"expected one update for real group 0: {groups!r}"
+    real_bounding = groups[0]["bounding"]
+
+    # The "Loaders" cluster loses both members to the real group -> fewer
+    # than 2 free members -> the synthetic cluster is dropped entirely.
+    ng = res["new_groups"]
+    assert [g["title"] for g in ng] == ["Sampling"], (
+        f"expected only the Sampling cluster to survive, got: {ng!r}")
+    sampling_bounding = ng[0]["bounding"]
+
+    nodes = node_map(wf)
+    for nid in (4, 10):
+        rect = visual_rect(nodes[nid], res["positions"][str(nid)])
+        assert rect_inside(rect, real_bounding), (
+            f"real-group node {nid} rect {rect} not inside updated real "
+            f"group bounding {real_bounding}")
+        assert not center_inside(rect, sampling_bounding), (
+            f"real-group node {nid} leaked into the synthetic Sampling frame")
+    for nid in (3, 5):
+        rect = visual_rect(nodes[nid], res["positions"][str(nid)])
+        assert rect_inside(rect, sampling_bounding), (
+            f"cluster node {nid} rect {rect} not inside Sampling bounding "
+            f"{sampling_bounding}")
+        assert not center_inside(rect, real_bounding), (
+            f"cluster node {nid} leaked into the real group frame")
+
+
+@case("8. run_layout llm enabled + group_mode=refit -> llm skipped, layout ok")
+def case_refit_skips_llm():
+    SERVER.chat_content = CONTENT_HAPPY
+    wf = make_workflow()
+    before = len(SERVER.snapshot())
+    res = layout_sort.run_layout(
+        wf, {"group_mode": "refit"},
+        {"enabled": True, "base_url": BASE, "model": ""})
+    after = len(SERVER.snapshot())
+
+    assert after == before, "LLM server was contacted despite group_mode=refit"
+    info = res.get("llm")
+    assert isinstance(info, dict) and info.get("used") is False, \
+        f"expected llm used=False, got: {info!r}"
+    assert isinstance(info.get("error"), str) and "group_mode" in info["error"], \
+        f"expected explanatory group_mode error, got: {info.get('error')!r}"
+    assert set(res["positions"].keys()) == {str(n["id"]) for n in wf["nodes"]}, \
+        "refit layout missing positions"
+    assert res["new_groups"] == [], f"refit must not invent groups: {res['new_groups']!r}"
+
+
+@case("9. dropped singleton cluster must NOT consume its node id (fixed)")
+def case_probe_singleton_consumes():
+    # Regression test for the _validate fix: ids are claimed only by
+    # clusters that survive the len>=2 check, so a node listed in a
+    # discarded singleton X stays available to a later valid cluster Y.
+    SERVER.chat_content = json.dumps({"clusters": [
+        {"name": "X", "node_ids": [6]},
+        {"name": "Y", "node_ids": [6, 7]},
+    ]})
+    clusters, err = llm_client.suggest_clusters(
+        make_workflow(), base_url=BASE, model="", timeout=30)
+    assert err is None, f"unexpected error: {err!r}"
+    assert clusters == [{"name": "Y", "node_ids": [6, 7]}], \
+        f"Y should survive with both members: {clusters!r}"
+
+
+# ---------------------------------------------------------------------------
+# Runner
+# ---------------------------------------------------------------------------
+
+def main():
+    global SERVER, BASE
+    SERVER = MockLLMServer(("127.0.0.1", 0), MockLLMHandler)
+    BASE = f"http://127.0.0.1:{SERVER.server_address[1]}/v1"
+    thread = threading.Thread(target=SERVER.serve_forever, daemon=True)
+    thread.start()
+
+    results = []
+    try:
+        for name, fn in CASES:
+            SERVER.reset()
+            try:
+                fn()
+                results.append((name, True, ""))
+            except Exception:
+                results.append((name, False, traceback.format_exc()))
+    finally:
+        SERVER.shutdown()
+        SERVER.server_close()
+
+    print(f"mock server: {BASE}")
+    failed = 0
+    for name, ok, detail in results:
+        print(f"[{'PASS' if ok else 'FAIL'}] {name}")
+        if not ok:
+            failed += 1
+            print("      " + "\n      ".join(detail.strip().splitlines()))
+    print(f"\n{len(results) - failed}/{len(results)} cases passed")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

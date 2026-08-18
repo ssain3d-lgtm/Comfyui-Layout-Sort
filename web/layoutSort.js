@@ -38,12 +38,20 @@ function applyGroups(groups) {
 function createGroups(newGroups) {
     const LGraphGroup = window.LiteGraph?.LGraphGroup;
     if (!newGroups?.length || !LGraphGroup) return;
-    let colorIndex = graphGroups().length;
+    const existing = graphGroups();
+    let colorIndex = existing.length;
     for (const g of newGroups) {
         const b = g.bounding;
         if (!Array.isArray(b) || b.length < 4) continue;
+        const title = g.title || "Cluster";
+        // Rapid re-runs can deliver the same suggestions twice before the
+        // first frames are part of the serialized graph — don't duplicate.
+        if (existing.some((e) => e.title === title
+                && Math.abs(e.pos[0] - b[0]) < 1 && Math.abs(e.pos[1] - b[1]) < 1)) {
+            continue;
+        }
         const group = new LGraphGroup();
-        group.title = g.title || "Cluster";
+        group.title = title;
         group.color = GROUP_COLORS[colorIndex++ % GROUP_COLORS.length];
         group.pos = [b[0], b[1]];
         group.size = [b[2], b[3]];
@@ -73,16 +81,16 @@ function notifyLlm(llm) {
 }
 
 function applyLayout({ positions, groups, new_groups, llm, animate }) {
-    notifyLlm(llm);
     const moves = collectMoves(positions);
     if (!moves.length) return;
     // A broadcast event may reach a tab showing a different workflow;
-    // only apply when the ids clearly belong to this graph.
+    // only apply (or toast) when the ids clearly belong to this graph.
     const total = Object.keys(positions ?? {}).length;
     if (total > 0 && moves.length / total < 0.9) {
         console.warn(`[LayoutSort] ignoring layout for a different graph (${moves.length}/${total} ids matched)`);
         return;
     }
+    notifyLlm(llm);
 
     const finish = () => {
         for (const m of moves) {
@@ -124,6 +132,8 @@ function widgetValue(node, name, fallback) {
 }
 
 async function sortNow(node) {
+    if (node.__layoutSortBusy) return;
+    node.__layoutSortBusy = true;
     const workflow = app.graph.serialize();
     const options = {
         direction: widgetValue(node, "direction", "left_to_right"),
@@ -153,6 +163,14 @@ async function sortNow(node) {
         });
     } catch (err) {
         console.error("[LayoutSort] sort request failed:", err);
+        app.extensionManager?.toast?.add?.({
+            severity: "error",
+            summary: "Layout Sort",
+            detail: `Sort failed: ${err}`,
+            life: 6000,
+        });
+    } finally {
+        node.__layoutSortBusy = false;
     }
 }
 
