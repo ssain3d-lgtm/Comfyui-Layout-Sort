@@ -101,16 +101,7 @@ function notifyLlm(llm) {
     }
 }
 
-function applySizes(sizes) {
-    for (const [id, size] of Object.entries(sizes ?? {})) {
-        const node = findNode(id);
-        if (!node || !Array.isArray(size)) continue;
-        node.size[0] = size[0];
-        node.size[1] = size[1];
-    }
-}
-
-function applyLayout({ positions, sizes, groups, new_groups, reroutes, llm, animate }) {
+function applyLayout({ positions, groups, new_groups, reroutes, llm, animate }) {
     const moves = collectMoves(positions);
     if (!moves.length) return;
     // A broadcast event may reach a tab showing a different workflow;
@@ -132,7 +123,6 @@ function applyLayout({ positions, sizes, groups, new_groups, reroutes, llm, anim
             m.node.pos[0] = m.to[0];
             m.node.pos[1] = m.to[1];
         }
-        applySizes(sizes);
         applyGroups(groups);
         applyReroutes(reroutes);
         createGroups(new_groups);
@@ -199,7 +189,6 @@ async function sortNow(node) {
         const result = await res.json();
         applyLayout({
             positions: result.positions,
-            sizes: result.sizes,
             groups: result.groups,
             new_groups: result.new_groups,
             reroutes: result.reroutes,
@@ -343,7 +332,7 @@ const PROVIDER_URLS = {
 
 const COMBO_VALUES = {
     direction: ["left_to_right", "top_to_bottom"],
-    group_mode: ["cluster", "refit"],
+    group_mode: ["cluster", "inner", "refit"],
     style: ["grid", "flow"],
     llm_provider: ["lmstudio", "ollama", "openai", "anthropic", "custom"],
 };

@@ -57,10 +57,12 @@ DEFAULT_OPTIONS = {
     # top-left corner); "center": columns center on a shared axis, which
     # shortens diagonal links when column heights differ a lot.
     "align": "top",
-    # Widen every non-collapsed node to its column's width so column edges
-    # line up exactly. Only ever widens, never shrinks.
-    "equalize_widths": False,
-    # Round the final coordinates (and equalized widths) to this grid.
+    # Treat Set/Get wireless pairs (KJNodes SetNode/GetNode and lookalikes)
+    # as layout-only virtual links so the logical flow they carry shapes
+    # the layout even though no cable exists in the JSON.
+    "link_set_get": True,
+    # Round the final coordinates to this grid. Node sizes are never
+    # touched — the sorter only moves things.
     "snap_grid": 10,
 }
 
@@ -110,8 +112,6 @@ def _normalize_nodes(workflow):
             "w": width,
             "h": (0.0 if collapsed else max(size[1], 1.0)) + TITLE_HEIGHT,
             "type": str(raw.get("type") or ""),
-            "collapsed": collapsed,
-            "raw_h": max(size[1], 1.0),
         }
     return nodes
 
@@ -143,6 +143,49 @@ def _normalize_links(workflow, nodes, detach_types=()):
             edges.append((origin, target, int(slot or 0)))
         except (TypeError, ValueError):
             edges.append((origin, target, 0))
+    return edges
+
+
+def _wireless_edges(workflow, nodes):
+    """Layout-only virtual edges for Set/Get wireless pairs.
+
+    KJNodes' SetNode stores a value under a key and GetNode retrieves it;
+    the JSON has no link between them, so without this the layout sees
+    every GetNode as a source and every SetNode as a sink, scrambling the
+    macro order (outputs drifting ahead of the loops that feed them). The
+    key lives in widgets_values[0]; the Set_/Get_ title prefix is the
+    fallback. No cable is created — these edges only inform the layout."""
+    by_str = {str(nid): nid for nid in nodes}
+    setters, getters = {}, {}
+    for raw in workflow.get("nodes") or []:
+        if not isinstance(raw, dict):
+            continue
+        node_type = str(raw.get("type") or "")
+        is_set = node_type.endswith("SetNode") or node_type == "easy setNode"
+        is_get = node_type.endswith("GetNode") or node_type == "easy getNode"
+        if not (is_set or is_get):
+            continue
+        key = None
+        widgets = raw.get("widgets_values")
+        if isinstance(widgets, list) and widgets and isinstance(widgets[0], str):
+            key = widgets[0].strip()
+        if not key:
+            title = str(raw.get("title") or "")
+            for prefix in ("Set_", "Get_", "Set ", "Get "):
+                if title.startswith(prefix):
+                    key = title[len(prefix):].strip()
+                    break
+        nid = by_str.get(str(raw.get("id")))
+        if not key or nid is None:
+            continue
+        (setters if is_set else getters).setdefault(key, []).append(nid)
+
+    edges = []
+    for key, sources in setters.items():
+        for target in getters.get(key, []):
+            for source in sources:
+                if source != target:
+                    edges.append((source, target, 0))
     return edges
 
 
@@ -335,13 +378,11 @@ def _wrap_layers(items, ordered_layers, direction, v_spacing, wrap_breadth):
 
 
 def _place_layers(items, ordered_layers, direction, h_spacing, v_spacing,
-                  align="top", col_thickness=None):
+                  align="top"):
     """Assign visual top-left coordinates layer by layer.
 
     align="top": layers share a top (left_to_right) or left (top_to_bottom)
-    edge; align="center": layers center on a shared axis. When given,
-    `col_thickness` collects {item_id: layer thickness} so the caller can
-    equalize node widths to their column."""
+    edge; align="center": layers center on a shared axis."""
     positions = {}
     if not ordered_layers:
         return positions, (0.0, 0.0)
@@ -359,8 +400,6 @@ def _place_layers(items, ordered_layers, direction, h_spacing, v_spacing,
             for iid in row:
                 positions[iid] = [cross, main]
                 cross += items[iid]["w"] + v_spacing
-                if col_thickness is not None:
-                    col_thickness[iid] = thick
             main += thick + h_spacing
         return positions, (max_breadth, main - h_spacing)
 
@@ -377,8 +416,6 @@ def _place_layers(items, ordered_layers, direction, h_spacing, v_spacing,
         for iid in col:
             positions[iid] = [main + (thick - items[iid]["w"]) / 2.0, cross]
             cross += items[iid]["h"] + v_spacing
-            if col_thickness is not None:
-                col_thickness[iid] = thick
         main += thick + h_spacing
     return positions, (main - h_spacing, max_breadth)
 
@@ -411,7 +448,7 @@ def _place_islands(items, islands, main_extent, h_spacing, v_spacing):
 
 
 def _layered_layout(items, edges, direction, h_spacing, v_spacing, sweeps,
-                    wrap_breadth=0, align="top", col_thickness=None):
+                    wrap_breadth=0, align="top"):
     """Run the full layered pipeline. Returns (positions, (width, height))
     with positions normalized to a tight box anchored at (0, 0)."""
     if not items:
@@ -421,8 +458,7 @@ def _layered_layout(items, edges, direction, h_spacing, v_spacing, sweeps,
     ordered_layers = _wrap_layers(items, ordered_layers, direction,
                                   v_spacing, wrap_breadth)
     positions, main_extent = _place_layers(
-        items, ordered_layers, direction, h_spacing, v_spacing,
-        align, col_thickness,
+        items, ordered_layers, direction, h_spacing, v_spacing, align
     )
     positions.update(_place_islands(items, islands, main_extent, h_spacing, v_spacing))
 
@@ -517,7 +553,7 @@ def _build_hierarchy(nodes, groups, extra_clusters=None, synthetic_start=0):
 
 def _cluster_layout(nodes, edges, groups, direction, h_spacing, v_spacing,
                     sweeps, extra_clusters=None, synthetic_start=0,
-                    wrap_breadth=0, align="top", col_thickness=None):
+                    wrap_breadth=0, align="top"):
     """Recursive compound layout: every group (nested ones included) is laid
     out as its own cluster, then each container arranges its direct child
     clusters and loose nodes with the same layered algorithm. Sibling frames
@@ -576,7 +612,7 @@ def _cluster_layout(nodes, edges, groups, direction, h_spacing, v_spacing,
 
         positions, (width, height) = _layered_layout(
             items, container_edges, direction, h_spacing, v_spacing, sweeps,
-            wrap_breadth, align, col_thickness,
+            wrap_breadth, align,
         )
         layouts[container] = positions
         if container is not None:
@@ -604,6 +640,53 @@ def _cluster_layout(nodes, edges, groups, direction, h_spacing, v_spacing,
     emit(None, 0.0, 0.0)
     updates = [{"index": index, "bounding": bounding}
                for index, bounding in sorted(frames.items())]
+    return positions, updates
+
+
+def _inner_group_layout(nodes, edges, groups, direction, h_spacing,
+                        v_spacing, sweeps, wrap_breadth, align):
+    """group_mode="inner": preserve the user's macro arrangement.
+
+    Each top-level group keeps its current top-left corner; only its
+    subtree (member nodes and nested child groups) is re-laid-out, with
+    the frame resized to fit. Ungrouped nodes and empty groups are not
+    touched at all. Returns absolute visual positions for exactly the
+    nodes that moved."""
+    children, roots, node_group, _chains, _synthetic = _build_hierarchy(
+        nodes, groups)
+    by_index = {g["index"]: g for g in groups}
+
+    positions = {}
+    updates = []
+    for root_index in roots:
+        subtree = set()
+        stack = [root_index]
+        while stack:
+            gindex = stack.pop()
+            subtree.add(gindex)
+            stack.extend(children[gindex])
+        members = {nid: nodes[nid] for nid in nodes
+                   if node_group.get(nid) in subtree}
+        if not members:
+            continue
+        sub_edges = [e for e in edges if e[0] in members and e[1] in members]
+        sub_groups = [by_index[gindex] for gindex in sorted(subtree)]
+        rel_positions, rel_updates = _cluster_layout(
+            members, sub_edges, sub_groups, direction, h_spacing,
+            v_spacing, sweeps, None, 0, wrap_breadth, align,
+        )
+        anchor = by_index[root_index]
+        root_frame = next(
+            (u for u in rel_updates if u["index"] == root_index), None)
+        dx = anchor["x"] - (root_frame["bounding"][0] if root_frame else 0.0)
+        dy = anchor["y"] - (root_frame["bounding"][1] if root_frame else 0.0)
+        for nid, rel in rel_positions.items():
+            positions[nid] = [rel[0] + dx, rel[1] + dy]
+        for u in rel_updates:
+            bounding = u["bounding"]
+            updates.append({"index": u["index"],
+                            "bounding": [bounding[0] + dx, bounding[1] + dy,
+                                         bounding[2], bounding[3]]})
     return positions, updates
 
 
@@ -771,64 +854,57 @@ def compute_layout(workflow, options=None, extra_clusters=None):
     sweeps = int(_finite(opts.get("barycenter_sweeps", 4), 4))
     wrap_breadth = max(0.0, _finite(opts.get("wrap_breadth", 2600), 2600))
     align = "center" if str(opts.get("align") or "top") == "center" else "top"
-    equalize = bool(opts.get("equalize_widths"))
     snap = max(0.0, _finite(opts.get("snap_grid", 10), 10))
 
     nodes = _normalize_nodes(workflow)
     if not nodes:
-        return {"positions": {}, "sizes": {}, "groups": [],
+        return {"positions": {}, "groups": [],
                 "new_groups": [], "reroutes": {}}
     edges = _normalize_links(workflow, nodes, opts.get("detach_types") or ())
+    if opts.get("link_set_get", True):
+        edges += _wireless_edges(workflow, nodes)
     groups = _normalize_groups(workflow)
     synthetic_start = len(workflow.get("groups") or [])
 
-    col_thickness = {}
-    if group_mode == "cluster" and (groups or extra_clusters):
+    if group_mode == "inner":  # no groups -> nothing to sort inside
+        positions, group_updates = _inner_group_layout(
+            nodes, edges, groups, direction, h_spacing, v_spacing, sweeps,
+            wrap_breadth, align,
+        )
+    elif group_mode == "cluster" and (groups or extra_clusters):
         positions, group_updates = _cluster_layout(
             nodes, edges, groups, direction, h_spacing, v_spacing, sweeps,
             extra_clusters, synthetic_start, wrap_breadth, align,
-            col_thickness,
         )
     else:
         positions, _extent = _layered_layout(
             nodes, edges, direction, h_spacing, v_spacing, sweeps,
-            wrap_breadth, align, col_thickness,
+            wrap_breadth, align,
         )
         group_updates = _refit_member_groups(groups, nodes, positions)
 
-    # Column-width equalization: widen (never shrink) every layered,
-    # non-collapsed node to its column so edges line up exactly. Islands
-    # (notes etc.) and cluster blocks keep their size.
-    sizes = {}
-    if equalize and direction != "top_to_bottom":
-        for key, thickness in col_thickness.items():
-            if isinstance(key, tuple):
-                if key[0] != "node":
-                    continue
-                nid = key[1]
-            else:
-                nid = key
-            node = nodes.get(nid)
-            if node is None or node["collapsed"] or thickness <= node["w"]:
-                continue
-            sizes[nid] = [thickness, node["raw_h"]]
-            # Placement centered the original width inside the column;
-            # shift left so the widened node spans the column exactly.
-            positions[nid][0] -= (thickness - node["w"]) / 2.0
 
-    occupied = [(p[0], p[1], nodes[nid]["w"], nodes[nid]["h"])
-                for nid, p in positions.items()]
-    occupied += [tuple(u["bounding"]) for u in group_updates]
-    group_updates += _park_stale_groups(
-        groups, {u["index"] for u in group_updates}, occupied, v_spacing
-    )
+    if group_mode != "inner":
+        # In inner mode untouched groups stay exactly where the user put
+        # them — parking would defeat the point of preserving the macro
+        # arrangement.
+        occupied = [(p[0], p[1], nodes[nid]["w"], nodes[nid]["h"])
+                    for nid, p in positions.items()]
+        occupied += [tuple(u["bounding"]) for u in group_updates]
+        group_updates += _park_stale_groups(
+            groups, {u["index"] for u in group_updates}, occupied, v_spacing
+        )
     reroutes = _compute_reroutes(workflow, nodes, positions)
 
     # Anchor the new layout at the old graph's visual top-left so the
     # canvas view doesn't jump to a different region, and convert visual
-    # tops back to LiteGraph pos (top of the node body).
-    origin_x = min(n["x"] for n in nodes.values())
-    origin_y = min(n["y"] for n in nodes.values())
+    # tops back to LiteGraph pos (top of the node body). Inner mode is
+    # already absolute — every subtree is anchored at its group's corner.
+    if group_mode == "inner":
+        origin_x = origin_y = 0.0
+    else:
+        origin_x = min(n["x"] for n in nodes.values())
+        origin_y = min(n["y"] for n in nodes.values())
 
     def rounded(value):
         return round(value / snap) * snap if snap else value
@@ -852,9 +928,6 @@ def compute_layout(workflow, options=None, extra_clusters=None):
             str(nid): [rounded(origin_x + p[0]),
                        rounded(origin_y + p[1] + TITLE_HEIGHT)]
             for nid, p in positions.items()
-        },
-        "sizes": {
-            str(nid): [rounded(s[0]), s[1]] for nid, s in sizes.items()
         },
         "groups": [
             {"index": u["index"], "bounding": shifted(u["bounding"])}

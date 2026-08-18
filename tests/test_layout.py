@@ -293,6 +293,66 @@ wf_v1 = {
 check_reroute_chain(compute_layout(wf_v1, {"snap_grid": 0}))
 print("reroutes OK")
 
+# ----------------------------------- Set/Get wireless pairs shape the flow
+sg_wf = {
+    "nodes": [
+        node(1, "LoadImage", [0, 0], [200, 80]),
+        node(2, "SetNode", [300, 0], [150, 60]),
+        node(3, "GetNode", [0, 400], [150, 60]),
+        node(4, "SaveImage", [300, 400], [200, 80]),
+        node(5, "GetNode", [700, 700], [150, 60]),  # key via title fallback
+        node(6, "PreviewImage", [900, 700], [200, 80]),
+    ],
+    "links": [[1, 1, 0, 2, 0, "*"], [2, 3, 0, 4, 0, "*"],
+              [3, 5, 0, 6, 0, "*"]],
+}
+sg_wf["nodes"][1]["widgets_values"] = ["img"]
+sg_wf["nodes"][2]["widgets_values"] = ["img"]
+sg_wf["nodes"][4]["title"] = "Get_img"
+result = compute_layout(sg_wf, {"snap_grid": 0})
+pos = {int(k): v for k, v in result["positions"].items()}
+assert pos[2][0] + 150 <= pos[3][0] + 1e-6, \
+    "Set must lay out before its Get (virtual edge)"
+assert pos[2][0] + 150 <= pos[5][0] + 1e-6, \
+    "title-fallback Get must also follow the Set"
+assert pos[1][0] + 200 <= pos[2][0] + 1e-6 and pos[3][0] + 150 <= pos[4][0] + 1e-6
+compute_layout(sg_wf, {"snap_grid": 0, "link_set_get": False})  # opt-out works
+print("set/get wireless OK")
+
+# --------------------------- inner mode preserves the macro arrangement
+inner_wf = {
+    "nodes": [
+        node(1, "A", [1200, 1350], [200, 80]),   # G1, scrambled: A after B
+        node(2, "B", [1000, 1000], [200, 80]),   # G1
+        node(3, "C", [5000, 200], [200, 80]),    # G2
+        node(4, "Free", [9000, 9000], [200, 80]),  # ungrouped
+    ],
+    "links": [[1, 2, 0, 1, 0, "X"]],  # B -> A inside G1
+    "groups": [
+        {"title": "G1", "bounding": [950, 900, 600, 700]},
+        {"title": "G2", "bounding": [4950, 100, 400, 300]},
+    ],
+}
+result = compute_layout(inner_wf, {"group_mode": "inner", "snap_grid": 10})
+pos = {int(k): v for k, v in result["positions"].items()}
+assert set(pos) == {1, 2, 3}, f"ungrouped nodes must not move: {sorted(pos)}"
+frames = {u["index"]: u["bounding"] for u in result["groups"]}
+assert set(frames) == {0, 1}
+for gindex, (ox, oy) in ((0, (950, 900)), (1, (4950, 100))):
+    fx, fy = frames[gindex][0], frames[gindex][1]
+    assert abs(fx - ox) <= 10 and abs(fy - oy) <= 10, \
+        f"group {gindex} anchor moved: {(fx, fy)} vs {(ox, oy)}"
+assert pos[2][0] + 200 <= pos[1][0] + 1e-6, "flow inside the group must sort"
+for nid, gindex in ((1, 0), (2, 0), (3, 1)):
+    x, y, w, h = pos[nid][0], pos[nid][1] - TITLE_HEIGHT, 200, 80 + TITLE_HEIGHT
+    fx, fy, fw, fh = frames[gindex]
+    assert fx <= x and fy <= y and x + w <= fx + fw + 1e-6 \
+        and y + h <= fy + fh + 1e-6, f"node {nid} left frame {gindex}"
+assert compute_layout({"nodes": inner_wf["nodes"], "links": []},
+                      {"group_mode": "inner"})["positions"] == {}, \
+    "inner mode without groups must be a no-op"
+print("inner mode OK")
+
 # --------------------------------------------- style: align / equalize / snap
 style_wf = {
     "nodes": [
@@ -312,19 +372,12 @@ for pos in p.values():
 r_center = compute_layout(style_wf, {"align": "center", "snap_grid": 0})
 pc = {int(k): v for k, v in r_center["positions"].items()}
 assert pc[3][1] > pc[1][1], "centered column should sit lower than the top edge"
-# equalize_widths: node 2 (140 wide) widens to its column mate's 200,
-# and starts at the same x as node 1.
-r_eq = compute_layout(style_wf, {"align": "top", "equalize_widths": True,
-                                 "snap_grid": 10})
-sizes = {int(k): v for k, v in r_eq["sizes"].items()}
-peq = {int(k): v for k, v in r_eq["positions"].items()}
-assert sizes.get(2, [0])[0] == 200 and sizes[2][1] == 300, sizes
-assert 1 not in sizes, "already-widest node must keep its size"
-assert abs(peq[1][0] - peq[2][0]) < 1e-6, "equalized column edges must align"
+# Node sizes are never part of the result — the sorter only moves things.
+assert "sizes" not in r_top, "the sorter must not resize nodes"
 print("style options OK")
 
 # ---------------------------------------------------------------- degenerate
-assert compute_layout({}) == {"positions": {}, "sizes": {}, "groups": [],
+assert compute_layout({}) == {"positions": {}, "groups": [],
                               "new_groups": [], "reroutes": {}}
 assert compute_layout({"nodes": [], "links": None})["positions"] == {}
 compute_layout({"nodes": [node(1, "Solo", {"0": 5, "1": 6}, {"0": 100, "1": 50})],

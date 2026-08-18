@@ -34,13 +34,12 @@ WS_EVENT = "layout_sort_apply"
 LLM_TIMEOUT_SECONDS = 120
 
 # The style dropdown expands to engine options; explicit per-option keys
-# in the request still win over the preset.
+# in the request still win over the preset. Node sizes are never touched.
 STYLE_PRESETS = {
-    # Top-left aligned columns, node widths equalized per column, snapped
-    # to the canvas grid — the tidy "everything lines up" look.
-    "grid": {"align": "top", "equalize_widths": True},
-    # Centered columns, original node sizes — favors short, readable links.
-    "flow": {"align": "center", "equalize_widths": False},
+    # Top-left aligned columns snapped to the canvas grid — the tidy look.
+    "grid": {"align": "top"},
+    # Centered columns — favors short, readable links.
+    "flow": {"align": "center"},
 }
 
 # The API key is intentionally NOT a node widget: widget values get
@@ -354,20 +353,23 @@ class LayoutSort:
                      "tooltip": "Gap between nodes inside a layer in pixels."},
                 ),
                 "group_mode": (
-                    ["cluster", "refit"],
+                    ["cluster", "inner", "refit"],
                     {"default": "cluster",
                      "tooltip": "cluster: lay out each group as a block, then "
                                 "arrange the blocks (frames never overlap). "
+                                "inner: keep every group where you put it and "
+                                "only tidy the nodes inside each one "
+                                "(ungrouped nodes stay untouched). "
                                 "refit: ignore groups while sorting, then "
                                 "re-wrap each frame around its old members."},
                 ),
                 "style": (
                     ["grid", "flow"],
                     {"default": "grid",
-                     "tooltip": "grid: top-left aligned columns, node widths "
-                                "equalized per column, snapped to the canvas "
-                                "grid. flow: centered columns with original "
-                                "node sizes — favors short links."},
+                     "tooltip": "grid: top-left aligned columns snapped to "
+                                "the canvas grid. flow: centered columns — "
+                                "favors short links. Node sizes are never "
+                                "changed."},
                 ),
                 "animate": ("BOOLEAN", {"default": True}),
                 "llm_clustering": (
@@ -467,7 +469,6 @@ class LayoutSort:
         sid = getattr(server, "client_id", None)
         server.send_sync(WS_EVENT, {
             "positions": result["positions"],
-            "sizes": result.get("sizes") or {},
             "groups": result["groups"],
             "new_groups": result.get("new_groups") or [],
             "reroutes": result.get("reroutes") or {},
