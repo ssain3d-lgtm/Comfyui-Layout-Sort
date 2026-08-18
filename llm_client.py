@@ -62,12 +62,22 @@ RESPONSE_SCHEMA = {
 
 def build_digest(workflow):
     """Compact plain-text description of the graph for the model."""
+    # Subgraph instance nodes carry an opaque UUID as their type; resolve
+    # it to the subgraph's name so the model gets a semantic signal.
+    subgraph_names = {}
+    definitions = workflow.get("definitions") or {}
+    for sub in definitions.get("subgraphs") or []:
+        if isinstance(sub, dict) and sub.get("id") is not None:
+            subgraph_names[str(sub["id"])] = str(sub.get("name") or "Subgraph")
+
     lines = ["NODES (id | type | title):"]
     nodes = workflow.get("nodes") or []
     for raw in nodes[:MAX_NODES]:
         if not isinstance(raw, dict) or "id" not in raw:
             continue
         node_type = str(raw.get("type") or "?")
+        if node_type in subgraph_names:
+            node_type = f"[subgraph] {subgraph_names[node_type]}"
         title = str(raw.get("title") or "")
         suffix = f" | {title}" if title and title != node_type else ""
         lines.append(f"{raw['id']} | {node_type}{suffix}")
