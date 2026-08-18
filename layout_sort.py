@@ -39,6 +39,7 @@ def run_layout(workflow, options, llm_cfg=None):
             base_url=llm_cfg.get("base_url") or DEFAULT_BASE_URL,
             model=llm_cfg.get("model") or "",
             timeout=LLM_TIMEOUT_SECONDS,
+            api_key=llm_cfg.get("api_key") or "",
         )
         if error:
             llm_info = {"used": False, "error": error}
@@ -167,6 +168,16 @@ class LayoutSort:
                      "tooltip": "Model id to use. Leave empty to use the "
                                 "first model loaded in the server."},
                 ),
+                "llm_api_key": (
+                    "STRING",
+                    {"default": "",
+                     "tooltip": "Optional Bearer token. LM Studio needs none "
+                                "by default. CAUTION: widget values are saved "
+                                "into workflows and PNG metadata — for shared "
+                                "workflows set the LAYOUT_SORT_LLM_API_KEY "
+                                "environment variable instead and leave this "
+                                "empty."},
+                ),
             },
             "optional": {
                 "trigger": (
@@ -187,7 +198,7 @@ class LayoutSort:
         return float("nan")
 
     def sort(self, direction, layer_spacing, node_spacing, group_mode, animate,
-             llm_clustering, llm_base_url, llm_model,
+             llm_clustering, llm_base_url, llm_model, llm_api_key,
              trigger=None, extra_pnginfo=None, unique_id=None):
         workflow = (extra_pnginfo or {}).get("workflow")
         server = getattr(PromptServer, "instance", None) if PromptServer else None
@@ -205,6 +216,7 @@ class LayoutSort:
                 "enabled": llm_clustering,
                 "base_url": llm_base_url,
                 "model": llm_model,
+                "api_key": llm_api_key,
             },
         )
         # Target the client that queued this prompt; fall back to broadcast.

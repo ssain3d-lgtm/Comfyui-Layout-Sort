@@ -9,6 +9,7 @@ without an LLM; every failure here degrades to a plain sort.
 
 import json
 import logging
+import os
 import re
 import urllib.error
 import urllib.request
@@ -16,6 +17,8 @@ import urllib.request
 LOGGER = logging.getLogger("ComfyUI-Layout-Sort")
 
 DEFAULT_BASE_URL = "http://127.0.0.1:1234/v1"
+# Safe way to supply a token: it never gets serialized into workflows.
+API_KEY_ENV_VAR = "LAYOUT_SORT_LLM_API_KEY"
 MAX_NODES = 300
 MAX_LINKS = 800
 MAX_CLUSTERS = 12
@@ -105,14 +108,17 @@ def build_digest(workflow):
     return "\n".join(lines)
 
 
-def _request_json(url, payload, timeout):
+def _request_json(url, payload, timeout, api_key=""):
     # LM Studio runs on localhost: bypass any system proxy configuration.
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
     request = urllib.request.Request(
         url,
         data=data,
-        headers={"Content-Type": "application/json"},
+        headers=headers,
         method="POST" if data is not None else "GET",
     )
     with opener.open(request, timeout=timeout) as response:
@@ -122,8 +128,8 @@ def _request_json(url, payload, timeout):
         return json.loads(raw.decode("utf-8", "replace"))
 
 
-def _pick_model(base_url, timeout):
-    data = _request_json(base_url + "/models", None, timeout)
+def _pick_model(base_url, timeout, api_key=""):
+    data = _request_json(base_url + "/models", None, timeout, api_key)
     models = data.get("data") or []
     if not models:
         raise RuntimeError("no model is loaded in LM Studio")
@@ -211,8 +217,13 @@ def _validate(parsed, workflow):
     return clusters
 
 
-def suggest_clusters(workflow, base_url=None, model="", timeout=60):
+def suggest_clusters(workflow, base_url=None, model="", timeout=60, api_key=""):
     """Ask the local LLM for semantic clusters.
+
+    `api_key` is sent as a Bearer token when non-empty (LM Studio needs
+    none by default; proxies/remote servers may). Falls back to the
+    LAYOUT_SORT_LLM_API_KEY environment variable, which keeps the token
+    out of saved workflows.
 
     Returns (clusters, None) on success or ([], error_message) on any
     failure — callers fall back to a plain sort.
@@ -222,8 +233,9 @@ def suggest_clusters(workflow, base_url=None, model="", timeout=60):
         base = DEFAULT_BASE_URL
     if not re.match(r"^https?://", base, re.IGNORECASE):
         base = "http://" + base
+    api_key = (api_key or "").strip() or os.environ.get(API_KEY_ENV_VAR, "").strip()
     try:
-        model_id = (model or "").strip() or _pick_model(base, min(timeout, 15))
+        model_id = (model or "").strip() or _pick_model(base, min(timeout, 15), api_key)
         payload = {
             "model": model_id,
             "messages": [
@@ -235,7 +247,7 @@ def suggest_clusters(workflow, base_url=None, model="", timeout=60):
             "response_format": RESPONSE_SCHEMA,
         }
         try:
-            data = _request_json(base + "/chat/completions", payload, timeout)
+            data = _request_json(base + "/chat/completions", payload, timeout, api_key)
         except urllib.error.HTTPError as error:
             # Some models/servers reject structured output with a 400;
             # retry plain then. Other statuses (404/401/500...) would fail
@@ -245,7 +257,7 @@ def suggest_clusters(workflow, base_url=None, model="", timeout=60):
             if code != 400:
                 raise
             payload.pop("response_format", None)
-            data = _request_json(base + "/chat/completions", payload, timeout)
+            data = _request_json(base + "/chat/completions", payload, timeout, api_key)
         content = data["choices"][0]["message"]["content"]
         clusters = _validate(_extract_json(content), workflow)
         if not clusters:

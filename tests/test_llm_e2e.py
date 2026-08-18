@@ -54,10 +54,11 @@ class MockLLMServer(ThreadingHTTPServer):
             self.chat_content = "{}"     # message.content returned on success
             self.fail_on_response_format = False  # 400 any POST containing it
 
-    def record(self, method, path, body, raw):
+    def record(self, method, path, body, raw, auth=None):
         with self.lock:
             self.requests.append(
-                {"method": method, "path": path, "body": body, "raw": raw})
+                {"method": method, "path": path, "body": body, "raw": raw,
+                 "auth": auth})
 
     def snapshot(self):
         with self.lock:
@@ -79,7 +80,8 @@ class MockLLMHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        self.server.record("GET", self.path, None, "")
+        self.server.record("GET", self.path, None, "",
+                           self.headers.get("Authorization"))
         if self.path == "/v1/models":
             self._send(200, {"data": [{"id": "qwen-test"}]})
         else:
@@ -92,7 +94,8 @@ class MockLLMHandler(BaseHTTPRequestHandler):
             body = json.loads(raw)
         except ValueError:
             body = None
-        self.server.record("POST", self.path, body, raw)
+        self.server.record("POST", self.path, body, raw,
+                           self.headers.get("Authorization"))
         if self.path != "/v1/chat/completions":
             self._send(404, {"error": "not found"})
             return
@@ -413,6 +416,42 @@ def case_probe_singleton_consumes():
     assert err is None, f"unexpected error: {err!r}"
     assert clusters == [{"name": "Y", "node_ids": [6, 7]}], \
         f"Y should survive with both members: {clusters!r}"
+
+
+@case("10. api_key becomes a Bearer header; env var fallback; none by default")
+def case_api_key():
+    import os
+
+    # Explicit key: every request (model pick + chat) carries the header.
+    SERVER.chat_content = CONTENT_HAPPY
+    clusters, err = llm_client.suggest_clusters(
+        make_workflow(), base_url=BASE, model="", timeout=30,
+        api_key="sk-test-123")
+    assert err is None, f"unexpected error: {err!r}"
+    auths = [r["auth"] for r in SERVER.snapshot()]
+    assert auths and all(a == "Bearer sk-test-123" for a in auths), auths
+
+    # No key: no Authorization header at all (LM Studio default setup).
+    SERVER.reset()
+    SERVER.chat_content = CONTENT_HAPPY
+    clusters, err = llm_client.suggest_clusters(
+        make_workflow(), base_url=BASE, model="", timeout=30)
+    assert err is None, f"unexpected error: {err!r}"
+    auths = [r["auth"] for r in SERVER.snapshot()]
+    assert auths and all(a is None for a in auths), auths
+
+    # Env var fallback keeps tokens out of saved workflows.
+    SERVER.reset()
+    SERVER.chat_content = CONTENT_HAPPY
+    os.environ[llm_client.API_KEY_ENV_VAR] = "sk-from-env"
+    try:
+        clusters, err = llm_client.suggest_clusters(
+            make_workflow(), base_url=BASE, model="", timeout=30)
+    finally:
+        del os.environ[llm_client.API_KEY_ENV_VAR]
+    assert err is None, f"unexpected error: {err!r}"
+    auths = [r["auth"] for r in SERVER.snapshot()]
+    assert auths and all(a == "Bearer sk-from-env" for a in auths), auths
 
 
 # ---------------------------------------------------------------------------

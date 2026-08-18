@@ -145,6 +145,7 @@ async function sortNow(node) {
         enabled: widgetValue(node, "llm_clustering", false),
         base_url: widgetValue(node, "llm_base_url", ""),
         model: widgetValue(node, "llm_model", ""),
+        api_key: widgetValue(node, "llm_api_key", ""),
     };
     try {
         const res = await api.fetchApi("/layout_sort/compute", {
