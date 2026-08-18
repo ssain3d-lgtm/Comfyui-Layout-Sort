@@ -292,12 +292,16 @@ def _layered_layout(items, edges, direction, h_spacing, v_spacing, sweeps):
 # Group handling
 # ---------------------------------------------------------------------------
 
-def _build_hierarchy(nodes, groups):
+def _build_hierarchy(nodes, groups, extra_clusters=None, synthetic_start=0):
     """Containment forest over groups plus deepest-group node membership.
 
     A group's parent is the smallest group with a strictly larger area whose
     bounds contain its center (strict area ordering keeps this acyclic).
     Each node belongs to the smallest group containing its center.
+
+    `extra_clusters` ([{"name", "node_ids"}], e.g. LLM suggestions) become
+    synthetic root-level groups indexed from `synthetic_start`. They only
+    claim nodes that no real group contains, so user groups always win.
     """
     by_index = {g["index"]: g for g in groups}
     parent = {}
@@ -326,6 +330,30 @@ def _build_hierarchy(nodes, groups):
         if containing:
             node_group[nid] = min(containing, key=_group_area)["index"]
 
+    synthetic = {}
+    for offset, cluster in enumerate(extra_clusters or []):
+        members = [
+            nid for nid in cluster.get("node_ids") or []
+            if nid in nodes and node_group.get(nid) is None
+        ]
+        if len(members) < 2:
+            continue
+        index = synthetic_start + offset
+        for nid in members:
+            node_group[nid] = index
+        parent[index] = None
+        children[index] = []
+        roots.append(index)
+        synthetic[index] = {
+            "index": index,
+            # Old top-left of the members keeps ordering stable, like a
+            # real group's old bounding does.
+            "x": min(nodes[n]["x"] for n in members),
+            "y": min(nodes[n]["y"] for n in members),
+            "w": 1.0,
+            "h": 1.0,
+        }
+
     # Chain of containers from a node's deepest group up to the root (None).
     chains = {}
     for nid in nodes:
@@ -336,16 +364,20 @@ def _build_hierarchy(nodes, groups):
             cursor = parent[cursor]
         chain.append(None)
         chains[nid] = chain
-    return children, roots, node_group, chains
+    return children, roots, node_group, chains, synthetic
 
 
-def _cluster_layout(nodes, edges, groups, direction, h_spacing, v_spacing, sweeps):
+def _cluster_layout(nodes, edges, groups, direction, h_spacing, v_spacing,
+                    sweeps, extra_clusters=None, synthetic_start=0):
     """Recursive compound layout: every group (nested ones included) is laid
     out as its own cluster, then each container arranges its direct child
     clusters and loose nodes with the same layered algorithm. Sibling frames
     can therefore never overlap, at any nesting depth."""
-    children, root_groups, node_group, chains = _build_hierarchy(nodes, groups)
+    children, root_groups, node_group, chains, synthetic = _build_hierarchy(
+        nodes, groups, extra_clusters, synthetic_start
+    )
     by_index = {g["index"]: g for g in groups}
+    by_index.update(synthetic)
 
     direct_nodes = {index: [] for index in by_index}
     direct_nodes[None] = []
@@ -451,10 +483,16 @@ def _refit_member_groups(groups, nodes, positions):
 # Entry point
 # ---------------------------------------------------------------------------
 
-def compute_layout(workflow, options=None):
+def compute_layout(workflow, options=None, extra_clusters=None):
     """Compute a tidy layout for a serialized ComfyUI workflow.
 
-    Returns {"positions": {node_id: [x, y]}, "groups": [{"index", "bounding"}]}.
+    `extra_clusters` ([{"name", "node_ids"}], e.g. LLM suggestions) are laid
+    out as synthetic groups around nodes no real group contains; they come
+    back under "new_groups" so the frontend can create named frames.
+
+    Returns {"positions": {node_id: [x, y]},
+             "groups": [{"index", "bounding"}],
+             "new_groups": [{"title", "bounding"}]}.
     Positions use LiteGraph semantics (top of the node body).
     """
     opts = dict(DEFAULT_OPTIONS)
@@ -468,13 +506,15 @@ def compute_layout(workflow, options=None):
 
     nodes = _normalize_nodes(workflow)
     if not nodes:
-        return {"positions": {}, "groups": []}
+        return {"positions": {}, "groups": [], "new_groups": []}
     edges = _normalize_links(workflow, nodes)
     groups = _normalize_groups(workflow)
+    synthetic_start = len(workflow.get("groups") or [])
 
-    if group_mode == "cluster" and groups:
+    if group_mode == "cluster" and (groups or extra_clusters):
         positions, group_updates = _cluster_layout(
-            nodes, edges, groups, direction, h_spacing, v_spacing, sweeps
+            nodes, edges, groups, direction, h_spacing, v_spacing, sweeps,
+            extra_clusters, synthetic_start,
         )
     else:
         positions, _extent = _layered_layout(
@@ -487,21 +527,26 @@ def compute_layout(workflow, options=None):
     # tops back to LiteGraph pos (top of the node body).
     origin_x = min(n["x"] for n in nodes.values())
     origin_y = min(n["y"] for n in nodes.values())
+
+    def shifted(bounding):
+        return [origin_x + bounding[0], origin_y + bounding[1],
+                bounding[2], bounding[3]]
+
+    cluster_names = [c.get("name") or "Cluster" for c in extra_clusters or []]
     return {
         "positions": {
             str(nid): [origin_x + p[0], origin_y + p[1] + TITLE_HEIGHT]
             for nid, p in positions.items()
         },
         "groups": [
+            {"index": u["index"], "bounding": shifted(u["bounding"])}
+            for u in group_updates if u["index"] < synthetic_start
+        ],
+        "new_groups": [
             {
-                "index": u["index"],
-                "bounding": [
-                    origin_x + u["bounding"][0],
-                    origin_y + u["bounding"][1],
-                    u["bounding"][2],
-                    u["bounding"][3],
-                ],
+                "title": cluster_names[u["index"] - synthetic_start],
+                "bounding": shifted(u["bounding"]),
             }
-            for u in group_updates
+            for u in group_updates if u["index"] >= synthetic_start
         ],
     }

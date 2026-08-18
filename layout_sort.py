@@ -7,11 +7,53 @@ Two ways to trigger a sort:
   * Press the "Sort now" button on the node (added by web/layoutSort.js):
     the frontend POSTs the current graph to /layout_sort/compute and
     applies the returned positions immediately, no queue needed.
+
+Optionally, LM Studio (or any OpenAI-compatible local server) can suggest
+semantic clusters for nodes that are not inside any group; those clusters
+are laid out like groups and created as named frames on the canvas. Every
+LLM failure falls back to a plain sort.
 """
 
+import asyncio
+
 from .layout_core import compute_layout
+from .llm_client import DEFAULT_BASE_URL, suggest_clusters
 
 WS_EVENT = "layout_sort_apply"
+LLM_TIMEOUT_SECONDS = 120
+
+
+def run_layout(workflow, options, llm_cfg=None):
+    """Shared pipeline for the node and the HTTP route: optionally ask the
+    local LLM for clusters, then compute the layout (falling back to a
+    plain sort whenever the LLM is unavailable)."""
+    extra_clusters = None
+    llm_info = None
+    use_llm = bool(llm_cfg and llm_cfg.get("enabled"))
+    if use_llm and (options.get("group_mode") or "cluster") != "cluster":
+        llm_info = {"used": False,
+                    "error": 'group_mode must be "cluster" for LLM clustering'}
+    elif use_llm:
+        clusters, error = suggest_clusters(
+            workflow,
+            base_url=llm_cfg.get("base_url") or DEFAULT_BASE_URL,
+            model=llm_cfg.get("model") or "",
+            timeout=LLM_TIMEOUT_SECONDS,
+        )
+        if error:
+            llm_info = {"used": False, "error": error}
+        else:
+            extra_clusters = clusters
+            llm_info = {
+                "used": True,
+                "clusters": len(clusters),
+                "names": [c["name"] for c in clusters],
+            }
+    result = compute_layout(workflow, options, extra_clusters)
+    if llm_info:
+        result["llm"] = llm_info
+    return result
+
 
 try:
     from server import PromptServer
@@ -25,8 +67,12 @@ try:
             return web.json_response({"error": "invalid json"}, status=400)
         workflow = data.get("workflow") or {}
         options = data.get("options") or {}
+        llm_cfg = data.get("llm") or {}
         try:
-            result = compute_layout(workflow, options)
+            # The LLM call can take a while; keep the event loop free.
+            result = await asyncio.get_running_loop().run_in_executor(
+                None, run_layout, workflow, options, llm_cfg
+            )
         except Exception as exc:  # never take the server down over a sort
             return web.json_response({"error": str(exc)}, status=500)
         return web.json_response(result)
@@ -82,6 +128,27 @@ class LayoutSort:
                                 "re-wrap each frame around its old members."},
                 ),
                 "animate": ("BOOLEAN", {"default": True}),
+                "llm_clustering": (
+                    "BOOLEAN",
+                    {"default": False,
+                     "tooltip": "Ask a local LLM (LM Studio / any "
+                                "OpenAI-compatible server) to group ungrouped "
+                                "nodes by function and create named frames "
+                                "for them. Falls back to a plain sort when "
+                                "the server is unreachable."},
+                ),
+                "llm_base_url": (
+                    "STRING",
+                    {"default": DEFAULT_BASE_URL,
+                     "tooltip": "OpenAI-compatible endpoint. LM Studio "
+                                "default: http://127.0.0.1:1234/v1"},
+                ),
+                "llm_model": (
+                    "STRING",
+                    {"default": "",
+                     "tooltip": "Model id to use. Leave empty to use the "
+                                "first model loaded in the server."},
+                ),
             },
             "optional": {
                 "trigger": (
@@ -102,21 +169,32 @@ class LayoutSort:
         return float("nan")
 
     def sort(self, direction, layer_spacing, node_spacing, group_mode, animate,
+             llm_clustering, llm_base_url, llm_model,
              trigger=None, extra_pnginfo=None, unique_id=None):
         workflow = (extra_pnginfo or {}).get("workflow")
         if not workflow or PromptServer is None:
             return {}
-        result = compute_layout(workflow, {
-            "direction": direction,
-            "h_spacing": layer_spacing,
-            "v_spacing": node_spacing,
-            "group_mode": group_mode,
-        })
+        result = run_layout(
+            workflow,
+            {
+                "direction": direction,
+                "h_spacing": layer_spacing,
+                "v_spacing": node_spacing,
+                "group_mode": group_mode,
+            },
+            {
+                "enabled": llm_clustering,
+                "base_url": llm_base_url,
+                "model": llm_model,
+            },
+        )
         # Target the client that queued this prompt; fall back to broadcast.
         sid = getattr(PromptServer.instance, "client_id", None)
         PromptServer.instance.send_sync(WS_EVENT, {
             "positions": result["positions"],
             "groups": result["groups"],
+            "new_groups": result.get("new_groups") or [],
+            "llm": result.get("llm"),
             "animate": bool(animate),
             "source_node": unique_id,
         }, sid)
