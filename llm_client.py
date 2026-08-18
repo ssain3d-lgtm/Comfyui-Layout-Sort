@@ -170,11 +170,13 @@ def _validate(parsed, workflow):
         members = []
         for value in item.get("node_ids") or []:
             nid = valid_ids.get(str(value))
-            if nid is not None and nid not in taken:
+            if nid is not None and nid not in taken and nid not in members:
                 members.append(nid)
-                taken.add(nid)
         if len(members) < 2:
             continue
+        # Claim ids only for clusters that survive, so a dropped singleton
+        # cannot starve a later valid cluster of its members.
+        taken.update(members)
         name = str(item.get("name") or "").strip()[:MAX_NAME_LENGTH]
         clusters.append({
             "name": name or f"Cluster {len(clusters) + 1}",

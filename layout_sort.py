@@ -44,12 +44,19 @@ def run_layout(workflow, options, llm_cfg=None):
             llm_info = {"used": False, "error": error}
         else:
             extra_clusters = clusters
-            llm_info = {
-                "used": True,
-                "clusters": len(clusters),
-                "names": [c["name"] for c in clusters],
-            }
+            llm_info = {"used": True}
     result = compute_layout(workflow, options, extra_clusters)
+    if llm_info and llm_info.get("used"):
+        # Report what actually got created: geometric filtering inside
+        # compute_layout (existing groups win) can drop suggestions.
+        created = result.get("new_groups") or []
+        if created:
+            llm_info["clusters"] = len(created)
+            llm_info["names"] = [g["title"] for g in created]
+        else:
+            llm_info = {"used": False,
+                        "error": "all suggested clusters were already "
+                                 "covered by existing groups"}
     if llm_info:
         result["llm"] = llm_info
     return result
