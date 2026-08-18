@@ -343,8 +343,12 @@ class LayoutSort:
                      "tooltip": "OpenAI-compatible endpoint. LM Studio "
                                 "default: http://127.0.0.1:1234/v1"},
                 ),
+                # A combo whose real options arrive at runtime: the Connect
+                # button fills widget.options.values from /layout_sort/models.
+                # VALIDATE_INPUTS below skips the stock is-it-in-the-list
+                # check, so any fetched model id validates.
                 "llm_model": (
-                    "STRING",
+                    ["auto"],
                     {"default": "auto",
                      "tooltip": "Model to use. \"auto\" picks the first model "
                                 "loaded in the server; press the Connect "
@@ -377,6 +381,13 @@ class LayoutSort:
     def IS_CHANGED(cls, **kwargs):
         # Re-run on every queue: sorting is a side effect, never cached.
         return float("nan")
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, llm_model):
+        # llm_model's combo options are dynamic (fetched from the LLM
+        # server at runtime), so the default list-membership validation
+        # would reject every real model id.
+        return True
 
     def sort(self, direction, layer_spacing, node_spacing, group_mode, animate,
              llm_clustering, llm_base_url, llm_model, llm_max_tokens,

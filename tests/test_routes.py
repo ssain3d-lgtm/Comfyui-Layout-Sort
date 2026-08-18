@@ -84,6 +84,14 @@ def call(method, path, request):
 
 
 def main():
+    # llm_model is a dynamic combo: declared with ["auto"] and exempted
+    # from list-membership validation so fetched model ids validate.
+    node_cls = layout_sort.LayoutSort
+    llm_model_decl = node_cls.INPUT_TYPES()["required"]["llm_model"]
+    assert llm_model_decl[0] == ["auto"], llm_model_decl
+    assert node_cls.VALIDATE_INPUTS(llm_model="any-fetched-model-id") is True
+    print("dynamic combo declaration OK")
+
     assert ("POST", "/layout_sort/compute") in HANDLERS, "compute not registered"
     assert ("GET", "/layout_sort/api_key") in HANDLERS, "key GET not registered"
     assert ("POST", "/layout_sort/api_key") in HANDLERS, "key POST not registered"

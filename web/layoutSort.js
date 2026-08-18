@@ -322,20 +322,10 @@ async function manageApiKey(node) {
 const MODEL_AUTO = "auto";
 
 function modelWidget(node) {
+    // Declared as a COMBO in Python (initial options: ["auto"]); the
+    // node's VALIDATE_INPUTS skips list-membership validation, so this
+    // widget only needs its options.values refreshed.
     return node.widgets?.find((w) => w.name === "llm_model");
-}
-
-function upgradeModelWidget(node) {
-    // The backend declares llm_model as STRING (so any value validates);
-    // present it as a dropdown that the Connect button fills in.
-    const widget = modelWidget(node);
-    if (!widget) return;
-    widget.type = "combo";
-    widget.options = widget.options ?? {};
-    if (!Array.isArray(widget.options.values) || !widget.options.values.length) {
-        widget.options.values = [MODEL_AUTO];
-    }
-    if (!widget.value) widget.value = MODEL_AUTO;
 }
 
 async function connectModels(node) {
@@ -385,7 +375,6 @@ app.registerExtension({
         const onNodeCreated = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function () {
             onNodeCreated?.apply(this, arguments);
-            upgradeModelWidget(this);
             // Instant sort without queueing the workflow.
             this.addWidget("button", "✨ Sort now", null, () => sortNow(this));
             this.addWidget("button", "🔌 Connect (load models)", null,
