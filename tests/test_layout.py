@@ -353,6 +353,47 @@ assert compute_layout({"nodes": inner_wf["nodes"], "links": []},
     "inner mode without groups must be a no-op"
 print("inner mode OK")
 
+# ------------------- inner mode: grown frames push neighbors, minimally
+push_wf = {
+    "nodes": [
+        node(1, "A", [20, 40], [200, 80]),     # G1: chain 1 -> 2 grows G1 wide
+        node(2, "B", [40, 200], [200, 80]),    # G1
+        node(3, "C", [340, 40], [200, 80]),    # G2 (right neighbor of G1)
+        node(4, "Far", [2000, 2000], [150, 60]),   # loose, out of harm's way
+        node(5, "InPath", [360, 250], [150, 60]),  # loose, below G2
+    ],
+    "links": [[1, 1, 0, 2, 0, "X"]],
+    "groups": [
+        {"title": "G1", "bounding": [0, 0, 280, 320]},
+        {"title": "G2", "bounding": [320, 0, 240, 150]},
+    ],
+}
+result = compute_layout(push_wf, {"group_mode": "inner", "snap_grid": 10})
+pos = {int(k): v for k, v in result["positions"].items()}
+frames = {u["index"]: u["bounding"] for u in result["groups"]}
+
+
+def vrect_of(nid, w, h):
+    return (pos[nid][0], pos[nid][1] - TITLE_HEIGHT, w, h + TITLE_HEIGHT)
+
+
+assert abs(frames[0][0]) <= 10 and abs(frames[0][1]) <= 10, \
+    f"G1 keeps its anchor: {frames[0]}"
+assert frames[0][2] > 400, "G1 should have grown around its chain"
+assert frames[1][0] >= 320 and frames[1][1] >= 0 \
+    and (frames[1][0], frames[1][1]) != (320.0, 0.0), \
+    f"G2 must be displaced right/down away from grown G1: {frames[1]}"
+assert not rects_overlap(tuple(frames[0]), tuple(frames[1])), \
+    "pushed frames must not overlap"
+assert 4 not in pos, "distant loose nodes stay untouched"
+if 5 in pos:  # nudged loose nodes only ever move right/down
+    assert pos[5][0] >= 360 and pos[5][1] >= 250, pos[5]
+loose5 = vrect_of(5, 150, 60) if 5 in pos else (360, 220, 150, 90)
+for f in frames.values():
+    assert not rects_overlap(loose5, tuple(f)), \
+        f"loose node 5 must not end up under a frame: {loose5} vs {f}"
+print("inner push-apart OK")
+
 # --------------------------------------------- style: align / equalize / snap
 style_wf = {
     "nodes": [

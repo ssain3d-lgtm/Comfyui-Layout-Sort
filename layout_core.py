@@ -53,10 +53,11 @@ DEFAULT_OPTIONS = {
     # split cannot create backward links — it just stops huge graphs from
     # becoming one enormously tall column.
     "wrap_breadth": 2600,
-    # "top": columns share a top edge (and group interiors pack from their
-    # top-left corner); "center": columns center on a shared axis, which
-    # shortens diagonal links when column heights differ a lot.
-    "align": "top",
+    # "center": columns center on a shared axis, which shortens diagonal
+    # links when column heights differ a lot (best default for big
+    # graphs); "top": columns share a top edge and group interiors pack
+    # from their top-left corner.
+    "align": "center",
     # Treat Set/Get wireless pairs (KJNodes SetNode/GetNode and lookalikes)
     # as layout-only virtual links so the logical flow they carry shapes
     # the layout even though no cable exists in the JSON.
@@ -658,6 +659,7 @@ def _inner_group_layout(nodes, edges, groups, direction, h_spacing,
 
     positions = {}
     updates = []
+    bodies = []  # rigid pieces for overlap separation
     for root_index in roots:
         subtree = set()
         stack = [root_index]
@@ -680,14 +682,99 @@ def _inner_group_layout(nodes, edges, groups, direction, h_spacing,
             (u for u in rel_updates if u["index"] == root_index), None)
         dx = anchor["x"] - (root_frame["bounding"][0] if root_frame else 0.0)
         dy = anchor["y"] - (root_frame["bounding"][1] if root_frame else 0.0)
+        body_updates = []
         for nid, rel in rel_positions.items():
             positions[nid] = [rel[0] + dx, rel[1] + dy]
         for u in rel_updates:
             bounding = u["bounding"]
-            updates.append({"index": u["index"],
-                            "bounding": [bounding[0] + dx, bounding[1] + dy,
-                                         bounding[2], bounding[3]]})
+            entry = {"index": u["index"],
+                     "bounding": [bounding[0] + dx, bounding[1] + dy,
+                                  bounding[2], bounding[3]]}
+            updates.append(entry)
+            body_updates.append(entry)
+        root_entry = next((u for u in body_updates
+                           if u["index"] == root_index), None)
+        if root_entry:
+            bodies.append({
+                "rect": list(root_entry["bounding"]),
+                "node_ids": list(rel_positions),
+                "updates": body_updates,
+                "group": True,
+            })
+    # Loose (ungrouped) nodes join as rigid bodies too: they normally stay
+    # untouched, but a grown frame may need to nudge them aside.
+    for nid, node in nodes.items():
+        if node_group.get(nid) is None:
+            bodies.append({
+                "rect": [node["x"], node["y"], node["w"], node["h"]],
+                "node_ids": [nid],
+                "updates": [],
+                "group": False,
+            })
+    _separate_inner_bodies(bodies)
+    for body in bodies:
+        dx, dy = body.get("dx", 0.0), body.get("dy", 0.0)
+        if not dx and not dy:
+            continue
+        for nid in body["node_ids"]:
+            if nid in positions:
+                positions[nid][0] += dx
+                positions[nid][1] += dy
+            else:  # a nudged loose node starts moving from its old spot
+                positions[nid] = [nodes[nid]["x"] + dx, nodes[nid]["y"] + dy]
+        for entry in body["updates"]:
+            entry["bounding"][0] += dx
+            entry["bounding"][1] += dy
     return positions, updates
+
+
+INNER_SEPARATION_MARGIN = 20.0
+
+
+def _separate_inner_bodies(bodies):
+    """Push overlapping rigid bodies apart after an inner-mode sort.
+
+    Frames anchored at their old top-left can grow right/down into a
+    neighbor. For every collision involving at least one group frame, the
+    body later in reading order moves right or down (whichever resolves
+    the overlap with the smaller push), so the user's arrangement shifts
+    minimally and only where needed. Two untouched loose nodes are never
+    separated — pre-existing overlaps outside groups are none of our
+    business in this mode."""
+    for body in bodies:
+        body["dx"] = 0.0
+        body["dy"] = 0.0
+
+    def rect(body):
+        x, y, w, h = body["rect"]
+        return (x + body["dx"], y + body["dy"], w, h)
+
+    for _ in range(200):
+        moved = False
+        for i, first in enumerate(bodies):
+            for second in bodies[i + 1:]:
+                # Two loose nodes that nothing has displaced keep whatever
+                # overlap the user left them with; once either has been
+                # nudged, it must keep clearing what it lands on.
+                if not (first["group"] or second["group"]
+                        or first["dx"] or first["dy"]
+                        or second["dx"] or second["dy"]):
+                    continue
+                a, b = rect(first), rect(second)
+                gap = INNER_SEPARATION_MARGIN
+                overlap_x = min(a[0] + a[2], b[0] + b[2]) - max(a[0], b[0])
+                overlap_y = min(a[1] + a[3], b[1] + b[3]) - max(a[1], b[1])
+                if overlap_x <= -gap or overlap_y <= -gap:
+                    continue
+                # Later in reading order moves, away from the anchor side.
+                mover = second if (b[1], b[0]) >= (a[1], a[0]) else first
+                if overlap_x + gap <= overlap_y + gap:
+                    mover["dx"] += overlap_x + gap
+                else:
+                    mover["dy"] += overlap_y + gap
+                moved = True
+        if not moved:
+            return
 
 
 def _refit_member_groups(groups, nodes, positions):
@@ -853,7 +940,7 @@ def compute_layout(workflow, options=None, extra_clusters=None):
     v_spacing = max(10.0, _finite(opts.get("v_spacing", 40), 40))
     sweeps = int(_finite(opts.get("barycenter_sweeps", 4), 4))
     wrap_breadth = max(0.0, _finite(opts.get("wrap_breadth", 2600), 2600))
-    align = "center" if str(opts.get("align") or "top") == "center" else "top"
+    align = "top" if str(opts.get("align") or "center") == "top" else "center"
     snap = max(0.0, _finite(opts.get("snap_grid", 10), 10))
 
     nodes = _normalize_nodes(workflow)

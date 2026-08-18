@@ -695,6 +695,7 @@ def case_anthropic_provider():
     assert llm_client._provider_for("https://api.openai.com/v1") == "openai"
 
     # llm_provider dropdown resolution.
+    # (see case 18 for the grouped-workflow skip)
     resolve = llm_client.resolve_base_url
     assert resolve("lmstudio", "http://ignored") == "http://127.0.0.1:1234/v1"
     assert resolve("ollama", "") == "http://127.0.0.1:11434/v1"
@@ -703,6 +704,21 @@ def case_anthropic_provider():
     assert resolve("custom", "http://my.server:8080/v1") == "http://my.server:8080/v1"
     assert resolve("custom", "") == llm_client.DEFAULT_BASE_URL
     assert resolve(None, "http://my.server:8080/v1") == "http://my.server:8080/v1"
+
+
+@case("18. LLM call is skipped entirely on an already-grouped workflow")
+def case_llm_skip_grouped():
+    SERVER.reset()
+    SERVER.chat_content = CONTENT_HAPPY
+    wf = make_workflow()
+    wf["groups"] = [{"title": "All", "bounding": [0, 0, 2200, 1200]}]
+    res = layout_sort.run_layout(
+        wf, {"group_mode": "cluster"},
+        {"enabled": True, "base_url": BASE, "model": ""})
+    llm = res.get("llm") or {}
+    assert llm.get("used") is False and llm.get("skipped"), llm
+    assert not SERVER.snapshot(), \
+        "no HTTP request may be made when clustering is skipped"
 
 
 # ---------------------------------------------------------------------------

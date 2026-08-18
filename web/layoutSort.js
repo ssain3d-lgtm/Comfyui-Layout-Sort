@@ -83,7 +83,14 @@ function createGroups(newGroups) {
 function notifyLlm(llm) {
     const toast = app.extensionManager?.toast;
     if (!llm) return;
-    if (llm.error) {
+    if (llm.skipped) {
+        toast?.add?.({
+            severity: "info",
+            summary: "Layout Sort",
+            detail: `LLM clustering skipped: ${llm.skipped}`,
+            life: 4000,
+        });
+    } else if (llm.error) {
         console.warn("[LayoutSort] LLM clustering skipped:", llm.error);
         toast?.add?.({
             severity: "warn",
@@ -168,7 +175,7 @@ async function sortNow(node) {
         h_spacing: widgetValue(node, "layer_spacing", 80),
         v_spacing: widgetValue(node, "node_spacing", 40),
         group_mode: widgetValue(node, "group_mode", "cluster"),
-        style: widgetValue(node, "style", "grid"),
+        style: widgetValue(node, "style", "flow"),
     };
     // The API key is deliberately absent here: it lives server-side only
     // (key dialog / env var) and must never enter the graph or this payload.
@@ -333,7 +340,7 @@ const PROVIDER_URLS = {
 const COMBO_VALUES = {
     direction: ["left_to_right", "top_to_bottom"],
     group_mode: ["cluster", "inner", "refit"],
-    style: ["grid", "flow"],
+    style: ["flow", "grid"],
     llm_provider: ["lmstudio", "ollama", "openai", "anthropic", "custom"],
 };
 

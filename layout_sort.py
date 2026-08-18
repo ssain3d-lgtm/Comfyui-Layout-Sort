@@ -20,7 +20,13 @@ import json
 import os
 import tempfile
 
-from .layout_core import compute_layout
+from .layout_core import (
+    _center,
+    _group_contains,
+    _normalize_groups,
+    _normalize_nodes,
+    compute_layout,
+)
 from .llm_client import (
     DEFAULT_BASE_URL,
     format_origin,
@@ -36,11 +42,16 @@ LLM_TIMEOUT_SECONDS = 120
 # The style dropdown expands to engine options; explicit per-option keys
 # in the request still win over the preset. Node sizes are never touched.
 STYLE_PRESETS = {
-    # Top-left aligned columns snapped to the canvas grid — the tidy look.
-    "grid": {"align": "top"},
-    # Centered columns — favors short, readable links.
+    # Centered columns — fewer crossings on big graphs (the default).
     "flow": {"align": "center"},
+    # Top-left aligned columns snapped to the canvas grid — the tidy look
+    # for small graphs.
+    "grid": {"align": "top"},
 }
+
+# With fewer ungrouped nodes than this, LLM clustering has nothing useful
+# to do (it only ever groups ungrouped nodes) — skip the call entirely.
+MIN_UNGROUPED_FOR_LLM = 4
 
 # The API key is intentionally NOT a node widget: widget values get
 # serialized into workflow JSON and PNG metadata, leaking the secret with
@@ -132,6 +143,15 @@ def store_api_key(key, allowed_origin=None):
         pass
 
 
+def _ungrouped_count(workflow):
+    nodes = _normalize_nodes(workflow)
+    groups = _normalize_groups(workflow)
+    return sum(
+        1 for node in nodes.values()
+        if not any(_group_contains(g, *_center(node)) for g in groups)
+    )
+
+
 def run_layout(workflow, options, llm_cfg=None):
     """Shared pipeline for the node and the HTTP route: optionally ask the
     local LLM for clusters, then compute the layout (falling back to a
@@ -157,6 +177,12 @@ def run_layout(workflow, options, llm_cfg=None):
     if use_llm and (options.get("group_mode") or "cluster") != "cluster":
         llm_info = {"used": False,
                     "error": 'group_mode must be "cluster" for LLM clustering'}
+    elif use_llm and _ungrouped_count(workflow) < MIN_UNGROUPED_FOR_LLM:
+        # The LLM only ever organizes ungrouped nodes; on an
+        # already-grouped workflow the call would just burn time.
+        llm_info = {"used": False,
+                    "skipped": "workflow is already organized by groups — "
+                               "too few ungrouped nodes for LLM clustering"}
     elif use_llm:
         # Priority: explicit (programmatic callers, who paired key and URL
         # themselves) > stored file (bound to its saved origin) > env var
@@ -364,12 +390,12 @@ class LayoutSort:
                                 "re-wrap each frame around its old members."},
                 ),
                 "style": (
-                    ["grid", "flow"],
-                    {"default": "grid",
-                     "tooltip": "grid: top-left aligned columns snapped to "
-                                "the canvas grid. flow: centered columns — "
-                                "favors short links. Node sizes are never "
-                                "changed."},
+                    ["flow", "grid"],
+                    {"default": "flow",
+                     "tooltip": "flow: centered columns — fewer crossings, "
+                                "best for big graphs. grid: top-left aligned "
+                                "columns snapped to the canvas grid. Node "
+                                "sizes are never changed."},
                 ),
                 "animate": ("BOOLEAN", {"default": True}),
                 "llm_clustering": (

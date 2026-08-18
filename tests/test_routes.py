@@ -90,6 +90,8 @@ def main():
     llm_model_decl = node_cls.INPUT_TYPES()["required"]["llm_model"]
     assert llm_model_decl[0] == ["auto"], llm_model_decl
     assert node_cls.VALIDATE_INPUTS(llm_model="any-fetched-model-id") is True
+    style_decl = node_cls.INPUT_TYPES()["required"]["style"]
+    assert style_decl[1]["default"] == "flow", style_decl
     print("dynamic combo declaration OK")
 
     assert ("POST", "/layout_sort/compute") in HANDLERS, "compute not registered"
