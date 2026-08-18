@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import urllib.error
+import urllib.parse
 import urllib.request
 
 LOGGER = logging.getLogger("ComfyUI-Layout-Sort")
@@ -108,9 +109,40 @@ def build_digest(workflow):
     return "\n".join(lines)
 
 
+def is_valid_api_key(key):
+    """Bearer tokens must be printable ASCII with no spaces or control
+    characters — anything else corrupts the HTTP header, and the resulting
+    exception text would echo the key into logs and error toasts."""
+    return all(33 <= ord(ch) <= 126 for ch in key)
+
+
+def _origin(url):
+    parts = urllib.parse.urlsplit(url)
+    scheme = (parts.scheme or "http").lower()
+    port = parts.port or {"http": 80, "https": 443}.get(scheme)
+    return (scheme, (parts.hostname or "").lower(), port)
+
+
+class _AuthStrippingRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """urllib forwards Authorization across redirects by default, so a
+    hostile or compromised endpoint could 302 the request elsewhere and
+    capture the token. Drop the header whenever a redirect leaves the
+    original origin (scheme, host, port)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new_request = super().redirect_request(
+            req, fp, code, msg, headers, newurl
+        )
+        if new_request is not None and _origin(newurl) != _origin(req.full_url):
+            new_request.remove_header("Authorization")
+        return new_request
+
+
 def _request_json(url, payload, timeout, api_key=""):
     # LM Studio runs on localhost: bypass any system proxy configuration.
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), _AuthStrippingRedirectHandler()
+    )
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
     headers = {"Content-Type": "application/json"}
     if api_key:
@@ -234,6 +266,10 @@ def suggest_clusters(workflow, base_url=None, model="", timeout=60, api_key=""):
     if not re.match(r"^https?://", base, re.IGNORECASE):
         base = "http://" + base
     api_key = (api_key or "").strip() or os.environ.get(API_KEY_ENV_VAR, "").strip()
+    if api_key and not is_valid_api_key(api_key):
+        # Refuse before any header is built, so the key value can never
+        # surface in an exception message, log line, or toast.
+        return [], "the API key contains invalid characters"
     try:
         model_id = (model or "").strip() or _pick_model(base, min(timeout, 15), api_key)
         payload = {

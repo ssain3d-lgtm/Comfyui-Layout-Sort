@@ -16,9 +16,10 @@ LLM failure falls back to a plain sort.
 
 import asyncio
 import os
+import tempfile
 
 from .layout_core import compute_layout
-from .llm_client import DEFAULT_BASE_URL, suggest_clusters
+from .llm_client import DEFAULT_BASE_URL, is_valid_api_key, suggest_clusters
 
 WS_EVENT = "layout_sort_apply"
 LLM_TIMEOUT_SECONDS = 120
@@ -38,10 +39,14 @@ def _key_file_path():
         return override
     try:
         import folder_paths
-        base = folder_paths.get_user_directory()
+        return os.path.join(folder_paths.get_user_directory(), KEY_FILE_NAME)
     except Exception:
-        base = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(base, KEY_FILE_NAME)
+        pass
+    # Never fall back into custom_nodes: backup tools that ignore
+    # .gitignore (e.g. Manager snapshots) could capture the key there.
+    home = os.path.expanduser("~")
+    base = home if home and home != "~" else tempfile.gettempdir()
+    return os.path.join(base, ".comfyui-layout-sort", KEY_FILE_NAME)
 
 
 def load_stored_api_key():
@@ -53,7 +58,12 @@ def load_stored_api_key():
 
 
 def store_api_key(key):
-    """Persist (or clear, for empty keys) the server-side API key."""
+    """Persist (or clear, for empty keys) the server-side API key.
+
+    Raises ValueError for keys with non-printable/non-ASCII characters —
+    they would corrupt the Authorization header and could echo the key
+    into error messages (see llm_client.is_valid_api_key).
+    """
     path = _key_file_path()
     if not key:
         try:
@@ -61,13 +71,18 @@ def store_api_key(key):
         except OSError:
             pass
         return
+    if not is_valid_api_key(key):
+        raise ValueError("API key contains invalid characters")
     directory = os.path.dirname(path)
     if directory:
-        os.makedirs(directory, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as handle:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+    # Create owner-only atomically (no 0644 window between open and chmod);
+    # the chmod still runs to tighten a pre-existing file.
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
         handle.write(key)
     try:
-        os.chmod(path, 0o600)  # owner-only where the OS supports it
+        os.chmod(path, 0o600)
     except OSError:
         pass
 
@@ -171,6 +186,9 @@ else:
             return web.json_response({"error": "key too long"}, status=400)
         try:
             store_api_key(key)
+        except ValueError as exc:
+            # Message is fixed text — never contains the key value.
+            return web.json_response({"error": str(exc)}, status=400)
         except OSError as exc:
             return web.json_response({"error": str(exc)}, status=500)
         return _key_status()

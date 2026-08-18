@@ -125,6 +125,8 @@ def _normalize_groups(workflow):
         if not isinstance(raw, dict):
             continue
         bounding = raw.get("bounding")
+        if isinstance(bounding, dict):  # same tolerance as node pos/size
+            bounding = [bounding.get(str(i)) for i in range(4)]
         if not isinstance(bounding, (list, tuple)) or len(bounding) < 4:
             continue
         try:

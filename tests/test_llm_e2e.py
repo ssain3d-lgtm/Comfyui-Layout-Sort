@@ -53,6 +53,7 @@ class MockLLMServer(ThreadingHTTPServer):
             self.requests = []           # [{"method","path","body","raw"}]
             self.chat_content = "{}"     # message.content returned on success
             self.fail_on_response_format = False  # 400 any POST containing it
+            self.redirect_models_to = None  # 302 /v1/models to this URL
 
     def record(self, method, path, body, raw, auth=None):
         with self.lock:
@@ -83,6 +84,13 @@ class MockLLMHandler(BaseHTTPRequestHandler):
         self.server.record("GET", self.path, None, "",
                            self.headers.get("Authorization"))
         if self.path == "/v1/models":
+            target = getattr(self.server, "redirect_models_to", None)
+            if target:
+                self.send_response(302)
+                self.send_header("Location", target)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             self._send(200, {"data": [{"id": "qwen-test"}]})
         else:
             self._send(404, {"error": "not found"})
@@ -492,12 +500,79 @@ def case_key_store():
         layout_sort.store_api_key("")
         assert layout_sort.load_stored_api_key() == ""
         assert not os.path.exists(handle.name), "clear must delete the file"
+
+        # With no override (and no folder_paths in the test env) the
+        # fallback must live OUTSIDE custom_nodes — backup tools that
+        # ignore .gitignore could otherwise capture the key.
+        os.environ.pop(layout_sort.KEY_FILE_ENV_VAR, None)
+        fallback = os.path.abspath(layout_sort._key_file_path())
+        assert not fallback.startswith(os.path.abspath(PKG_DIR) + os.sep), \
+            f"key fallback inside the package dir: {fallback}"
     finally:
         os.environ.pop(layout_sort.KEY_FILE_ENV_VAR, None)
         try:
             os.unlink(handle.name)
         except OSError:
             pass
+
+
+@case("12. invalid-character key is rejected without echoing the key")
+def case_invalid_key_chars():
+    import os
+    import tempfile
+
+    SERVER.reset()
+    SERVER.chat_content = CONTENT_HAPPY
+    secret = "sk-ZZSECRETZZ\nX: injected"
+    clusters, err = llm_client.suggest_clusters(
+        make_workflow(), base_url=BASE, model="", timeout=30, api_key=secret)
+    assert clusters == [] and err, (clusters, err)
+    assert "ZZSECRETZZ" not in err, f"key leaked into error: {err!r}"
+    assert not SERVER.snapshot(), "no request may reach the server"
+
+    # store_api_key refuses it too, with a fixed message.
+    handle = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
+    handle.close()
+    os.environ[layout_sort.KEY_FILE_ENV_VAR] = handle.name
+    try:
+        try:
+            layout_sort.store_api_key(secret)
+            raise AssertionError("store_api_key must reject control chars")
+        except ValueError as exc:
+            assert "ZZSECRETZZ" not in str(exc), str(exc)
+    finally:
+        os.environ.pop(layout_sort.KEY_FILE_ENV_VAR, None)
+        try:
+            os.unlink(handle.name)
+        except OSError:
+            pass
+
+
+@case("13. Authorization is stripped on cross-origin redirects")
+def case_redirect_strips_auth():
+    import threading
+
+    other = MockLLMServer(("127.0.0.1", 0), MockLLMHandler)
+    threading.Thread(target=other.serve_forever, daemon=True).start()
+    try:
+        SERVER.reset()
+        SERVER.chat_content = CONTENT_HAPPY
+        other.chat_content = CONTENT_HAPPY
+        # Different port = different origin, even on the same host.
+        SERVER.redirect_models_to = (
+            f"http://127.0.0.1:{other.server_address[1]}/v1/models")
+        clusters, err = llm_client.suggest_clusters(
+            make_workflow(), base_url=BASE, model="", timeout=30,
+            api_key="sk-redirect-test")
+        assert err is None, f"unexpected error: {err!r}"
+        first_hop = [r for r in SERVER.snapshot() if r["method"] == "GET"]
+        second_hop = [r for r in other.snapshot() if r["method"] == "GET"]
+        assert first_hop and first_hop[0]["auth"] == "Bearer sk-redirect-test", \
+            first_hop
+        assert second_hop and second_hop[0]["auth"] is None, \
+            f"token must not follow a cross-origin redirect: {second_hop}"
+    finally:
+        other.shutdown()
 
 
 # ---------------------------------------------------------------------------
