@@ -33,6 +33,16 @@ from .llm_client import (
 WS_EVENT = "layout_sort_apply"
 LLM_TIMEOUT_SECONDS = 120
 
+# The style dropdown expands to engine options; explicit per-option keys
+# in the request still win over the preset.
+STYLE_PRESETS = {
+    # Top-left aligned columns, node widths equalized per column, snapped
+    # to the canvas grid — the tidy "everything lines up" look.
+    "grid": {"align": "top", "equalize_widths": True},
+    # Centered columns, original node sizes — favors short, readable links.
+    "flow": {"align": "center", "equalize_widths": False},
+}
+
 # The API key is intentionally NOT a node widget: widget values get
 # serialized into workflow JSON and PNG metadata, leaking the secret with
 # every shared file. Instead it lives server-side only — in a file set via
@@ -137,6 +147,11 @@ def run_layout(workflow, options, llm_cfg=None):
             "this looks like an API-format workflow export (no layout "
             "data); load it into ComfyUI and sort the live graph instead"
         )
+    options = dict(options or {})
+    style = STYLE_PRESETS.get(str(options.pop("style", "") or "").lower())
+    if style:
+        options = {**style,
+                   **{k: v for k, v in options.items() if v is not None}}
     extra_clusters = None
     llm_info = None
     use_llm = bool(llm_cfg and llm_cfg.get("enabled"))
@@ -346,6 +361,14 @@ class LayoutSort:
                                 "refit: ignore groups while sorting, then "
                                 "re-wrap each frame around its old members."},
                 ),
+                "style": (
+                    ["grid", "flow"],
+                    {"default": "grid",
+                     "tooltip": "grid: top-left aligned columns, node widths "
+                                "equalized per column, snapped to the canvas "
+                                "grid. flow: centered columns with original "
+                                "node sizes — favors short links."},
+                ),
                 "animate": ("BOOLEAN", {"default": True}),
                 "llm_clustering": (
                     "BOOLEAN",
@@ -416,8 +439,8 @@ class LayoutSort:
         # would reject every real model id.
         return True
 
-    def sort(self, direction, layer_spacing, node_spacing, group_mode, animate,
-             llm_clustering, llm_provider, llm_base_url, llm_model,
+    def sort(self, direction, layer_spacing, node_spacing, group_mode, style,
+             animate, llm_clustering, llm_provider, llm_base_url, llm_model,
              llm_max_tokens, trigger=None, extra_pnginfo=None, unique_id=None):
         workflow = (extra_pnginfo or {}).get("workflow")
         server = getattr(PromptServer, "instance", None) if PromptServer else None
@@ -430,6 +453,7 @@ class LayoutSort:
                 "h_spacing": layer_spacing,
                 "v_spacing": node_spacing,
                 "group_mode": group_mode,
+                "style": style,
             },
             {
                 "enabled": llm_clustering,
@@ -443,6 +467,7 @@ class LayoutSort:
         sid = getattr(server, "client_id", None)
         server.send_sync(WS_EVENT, {
             "positions": result["positions"],
+            "sizes": result.get("sizes") or {},
             "groups": result["groups"],
             "new_groups": result.get("new_groups") or [],
             "reroutes": result.get("reroutes") or {},

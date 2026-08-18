@@ -101,7 +101,16 @@ function notifyLlm(llm) {
     }
 }
 
-function applyLayout({ positions, groups, new_groups, reroutes, llm, animate }) {
+function applySizes(sizes) {
+    for (const [id, size] of Object.entries(sizes ?? {})) {
+        const node = findNode(id);
+        if (!node || !Array.isArray(size)) continue;
+        node.size[0] = size[0];
+        node.size[1] = size[1];
+    }
+}
+
+function applyLayout({ positions, sizes, groups, new_groups, reroutes, llm, animate }) {
     const moves = collectMoves(positions);
     if (!moves.length) return;
     // A broadcast event may reach a tab showing a different workflow;
@@ -123,6 +132,7 @@ function applyLayout({ positions, groups, new_groups, reroutes, llm, animate }) 
             m.node.pos[0] = m.to[0];
             m.node.pos[1] = m.to[1];
         }
+        applySizes(sizes);
         applyGroups(groups);
         applyReroutes(reroutes);
         createGroups(new_groups);
@@ -168,6 +178,7 @@ async function sortNow(node) {
         h_spacing: widgetValue(node, "layer_spacing", 80),
         v_spacing: widgetValue(node, "node_spacing", 40),
         group_mode: widgetValue(node, "group_mode", "cluster"),
+        style: widgetValue(node, "style", "grid"),
     };
     // The API key is deliberately absent here: it lives server-side only
     // (key dialog / env var) and must never enter the graph or this payload.
@@ -188,6 +199,7 @@ async function sortNow(node) {
         const result = await res.json();
         applyLayout({
             positions: result.positions,
+            sizes: result.sizes,
             groups: result.groups,
             new_groups: result.new_groups,
             reroutes: result.reroutes,
@@ -329,6 +341,46 @@ const PROVIDER_URLS = {
     anthropic: "https://api.anthropic.com",
 };
 
+const COMBO_VALUES = {
+    direction: ["left_to_right", "top_to_bottom"],
+    group_mode: ["cluster", "refit"],
+    style: ["grid", "flow"],
+    llm_provider: ["lmstudio", "ollama", "openai", "anthropic", "custom"],
+};
+
+function sanitizeWidgets(node) {
+    // Workflows saved by older node versions restore widget values
+    // positionally, shifting them one slot when widgets were added (e.g.
+    // a URL lands in llm_provider and "auto" in llm_base_url, producing
+    // http://auto -> getaddrinfo failures). Repair anything implausible.
+    const get = (name) => node.widgets?.find((w) => w.name === name);
+    for (const [name, values] of Object.entries(COMBO_VALUES)) {
+        const widget = get(name);
+        if (!widget || values.includes(widget.value)) continue;
+        if (name === "llm_provider" && /^https?:\/\//i.test(String(widget.value))) {
+            const baseUrl = get("llm_base_url");
+            if (baseUrl) baseUrl.value = String(widget.value);
+            widget.value = "custom";
+        } else {
+            widget.value = values[0];
+        }
+    }
+    const baseUrl = get("llm_base_url");
+    if (baseUrl && (typeof baseUrl.value !== "string" || baseUrl.value === ""
+            || baseUrl.value === "auto")) {
+        baseUrl.value = PROVIDER_URLS[widgetValue(node, "llm_provider", "lmstudio")]
+            ?? PROVIDER_URLS.lmstudio;
+    }
+    const model = get("llm_model");
+    if (model && (typeof model.value !== "string" || /^\d+$/.test(model.value))) {
+        model.value = MODEL_AUTO;
+    }
+    const tokens = get("llm_max_tokens");
+    if (tokens && !(typeof tokens.value === "number" && tokens.value >= 256)) {
+        tokens.value = 4096;
+    }
+}
+
 function syncProviderUrl(node) {
     // Mirror the preset into llm_base_url so the UI shows the endpoint
     // actually used ("custom" keeps whatever the user typed).
@@ -410,6 +462,13 @@ app.registerExtension({
                 () => connectModels(this));
             this.addWidget("button", KEY_BUTTON_UNSET, null, () => manageApiKey(this));
             refreshKeyStatus(this);
+        };
+        const onConfigure = nodeType.prototype.onConfigure;
+        nodeType.prototype.onConfigure = function () {
+            onConfigure?.apply(this, arguments);
+            // Runs after saved widget values are applied — repair values
+            // shifted by older saves before they reach the backend.
+            sanitizeWidgets(this);
         };
     },
 });

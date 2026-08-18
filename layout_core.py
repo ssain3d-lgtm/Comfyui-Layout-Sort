@@ -53,6 +53,15 @@ DEFAULT_OPTIONS = {
     # split cannot create backward links — it just stops huge graphs from
     # becoming one enormously tall column.
     "wrap_breadth": 2600,
+    # "top": columns share a top edge (and group interiors pack from their
+    # top-left corner); "center": columns center on a shared axis, which
+    # shortens diagonal links when column heights differ a lot.
+    "align": "top",
+    # Widen every non-collapsed node to its column's width so column edges
+    # line up exactly. Only ever widens, never shrinks.
+    "equalize_widths": False,
+    # Round the final coordinates (and equalized widths) to this grid.
+    "snap_grid": 10,
 }
 
 GROUP_SIDE_PADDING = 24.0
@@ -101,6 +110,8 @@ def _normalize_nodes(workflow):
             "w": width,
             "h": (0.0 if collapsed else max(size[1], 1.0)) + TITLE_HEIGHT,
             "type": str(raw.get("type") or ""),
+            "collapsed": collapsed,
+            "raw_h": max(size[1], 1.0),
         }
     return nodes
 
@@ -323,9 +334,14 @@ def _wrap_layers(items, ordered_layers, direction, v_spacing, wrap_breadth):
     return wrapped
 
 
-def _place_layers(items, ordered_layers, direction, h_spacing, v_spacing):
-    """Assign visual top-left coordinates layer by layer, centered on a
-    shared axis. Returns (positions, (main_width, main_height))."""
+def _place_layers(items, ordered_layers, direction, h_spacing, v_spacing,
+                  align="top", col_thickness=None):
+    """Assign visual top-left coordinates layer by layer.
+
+    align="top": layers share a top (left_to_right) or left (top_to_bottom)
+    edge; align="center": layers center on a shared axis. When given,
+    `col_thickness` collects {item_id: layer thickness} so the caller can
+    equalize node widths to their column."""
     positions = {}
     if not ordered_layers:
         return positions, (0.0, 0.0)
@@ -339,10 +355,12 @@ def _place_layers(items, ordered_layers, direction, h_spacing, v_spacing):
         max_breadth = max(breadth)
         main = 0.0
         for row, thick, wide in zip(ordered_layers, thickness, breadth):
-            cross = (max_breadth - wide) / 2.0
+            cross = 0.0 if align == "top" else (max_breadth - wide) / 2.0
             for iid in row:
                 positions[iid] = [cross, main]
                 cross += items[iid]["w"] + v_spacing
+                if col_thickness is not None:
+                    col_thickness[iid] = thick
             main += thick + h_spacing
         return positions, (max_breadth, main - h_spacing)
 
@@ -355,10 +373,12 @@ def _place_layers(items, ordered_layers, direction, h_spacing, v_spacing):
     max_breadth = max(breadth)
     main = 0.0
     for col, thick, tall in zip(ordered_layers, thickness, breadth):
-        cross = (max_breadth - tall) / 2.0
+        cross = 0.0 if align == "top" else (max_breadth - tall) / 2.0
         for iid in col:
             positions[iid] = [main + (thick - items[iid]["w"]) / 2.0, cross]
             cross += items[iid]["h"] + v_spacing
+            if col_thickness is not None:
+                col_thickness[iid] = thick
         main += thick + h_spacing
     return positions, (main - h_spacing, max_breadth)
 
@@ -391,7 +411,7 @@ def _place_islands(items, islands, main_extent, h_spacing, v_spacing):
 
 
 def _layered_layout(items, edges, direction, h_spacing, v_spacing, sweeps,
-                    wrap_breadth=0):
+                    wrap_breadth=0, align="top", col_thickness=None):
     """Run the full layered pipeline. Returns (positions, (width, height))
     with positions normalized to a tight box anchored at (0, 0)."""
     if not items:
@@ -401,7 +421,8 @@ def _layered_layout(items, edges, direction, h_spacing, v_spacing, sweeps,
     ordered_layers = _wrap_layers(items, ordered_layers, direction,
                                   v_spacing, wrap_breadth)
     positions, main_extent = _place_layers(
-        items, ordered_layers, direction, h_spacing, v_spacing
+        items, ordered_layers, direction, h_spacing, v_spacing,
+        align, col_thickness,
     )
     positions.update(_place_islands(items, islands, main_extent, h_spacing, v_spacing))
 
@@ -496,7 +517,7 @@ def _build_hierarchy(nodes, groups, extra_clusters=None, synthetic_start=0):
 
 def _cluster_layout(nodes, edges, groups, direction, h_spacing, v_spacing,
                     sweeps, extra_clusters=None, synthetic_start=0,
-                    wrap_breadth=0):
+                    wrap_breadth=0, align="top", col_thickness=None):
     """Recursive compound layout: every group (nested ones included) is laid
     out as its own cluster, then each container arranges its direct child
     clusters and loose nodes with the same layered algorithm. Sibling frames
@@ -555,7 +576,7 @@ def _cluster_layout(nodes, edges, groups, direction, h_spacing, v_spacing,
 
         positions, (width, height) = _layered_layout(
             items, container_edges, direction, h_spacing, v_spacing, sweeps,
-            wrap_breadth,
+            wrap_breadth, align, col_thickness,
         )
         layouts[container] = positions
         if container is not None:
@@ -749,25 +770,51 @@ def compute_layout(workflow, options=None, extra_clusters=None):
     v_spacing = max(10.0, _finite(opts.get("v_spacing", 40), 40))
     sweeps = int(_finite(opts.get("barycenter_sweeps", 4), 4))
     wrap_breadth = max(0.0, _finite(opts.get("wrap_breadth", 2600), 2600))
+    align = "center" if str(opts.get("align") or "top") == "center" else "top"
+    equalize = bool(opts.get("equalize_widths"))
+    snap = max(0.0, _finite(opts.get("snap_grid", 10), 10))
 
     nodes = _normalize_nodes(workflow)
     if not nodes:
-        return {"positions": {}, "groups": [], "new_groups": [], "reroutes": {}}
+        return {"positions": {}, "sizes": {}, "groups": [],
+                "new_groups": [], "reroutes": {}}
     edges = _normalize_links(workflow, nodes, opts.get("detach_types") or ())
     groups = _normalize_groups(workflow)
     synthetic_start = len(workflow.get("groups") or [])
 
+    col_thickness = {}
     if group_mode == "cluster" and (groups or extra_clusters):
         positions, group_updates = _cluster_layout(
             nodes, edges, groups, direction, h_spacing, v_spacing, sweeps,
-            extra_clusters, synthetic_start, wrap_breadth,
+            extra_clusters, synthetic_start, wrap_breadth, align,
+            col_thickness,
         )
     else:
         positions, _extent = _layered_layout(
             nodes, edges, direction, h_spacing, v_spacing, sweeps,
-            wrap_breadth,
+            wrap_breadth, align, col_thickness,
         )
         group_updates = _refit_member_groups(groups, nodes, positions)
+
+    # Column-width equalization: widen (never shrink) every layered,
+    # non-collapsed node to its column so edges line up exactly. Islands
+    # (notes etc.) and cluster blocks keep their size.
+    sizes = {}
+    if equalize and direction != "top_to_bottom":
+        for key, thickness in col_thickness.items():
+            if isinstance(key, tuple):
+                if key[0] != "node":
+                    continue
+                nid = key[1]
+            else:
+                nid = key
+            node = nodes.get(nid)
+            if node is None or node["collapsed"] or thickness <= node["w"]:
+                continue
+            sizes[nid] = [thickness, node["raw_h"]]
+            # Placement centered the original width inside the column;
+            # shift left so the widened node spans the column exactly.
+            positions[nid][0] -= (thickness - node["w"]) / 2.0
 
     occupied = [(p[0], p[1], nodes[nid]["w"], nodes[nid]["h"])
                 for nid, p in positions.items()]
@@ -783,15 +830,31 @@ def compute_layout(workflow, options=None, extra_clusters=None):
     origin_x = min(n["x"] for n in nodes.values())
     origin_y = min(n["y"] for n in nodes.values())
 
+    def rounded(value):
+        return round(value / snap) * snap if snap else value
+
     def shifted(bounding):
-        return [origin_x + bounding[0], origin_y + bounding[1],
-                bounding[2], bounding[3]]
+        x = origin_x + bounding[0]
+        y = origin_y + bounding[1]
+        if not snap:
+            return [x, y, bounding[2], bounding[3]]
+        # Frames round outward (floor origin, ceil far edge) so snapping
+        # can never clip the content they enclose.
+        gx = math.floor(x / snap) * snap
+        gy = math.floor(y / snap) * snap
+        gw = math.ceil((x + bounding[2]) / snap) * snap - gx
+        gh = math.ceil((y + bounding[3]) / snap) * snap - gy
+        return [gx, gy, gw, gh]
 
     cluster_names = [c.get("name") or "Cluster" for c in extra_clusters or []]
     return {
         "positions": {
-            str(nid): [origin_x + p[0], origin_y + p[1] + TITLE_HEIGHT]
+            str(nid): [rounded(origin_x + p[0]),
+                       rounded(origin_y + p[1] + TITLE_HEIGHT)]
             for nid, p in positions.items()
+        },
+        "sizes": {
+            str(nid): [rounded(s[0]), s[1]] for nid, s in sizes.items()
         },
         "groups": [
             {"index": u["index"], "bounding": shifted(u["bounding"])}
@@ -805,7 +868,7 @@ def compute_layout(workflow, options=None, extra_clusters=None):
             for u in group_updates if u["index"] >= synthetic_start
         ],
         "reroutes": {
-            str(rid): [origin_x + p[0], origin_y + p[1]]
+            str(rid): [rounded(origin_x + p[0]), rounded(origin_y + p[1])]
             for rid, p in reroutes.items()
         },
     }

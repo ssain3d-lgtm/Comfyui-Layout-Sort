@@ -213,7 +213,9 @@ pos = {int(k): v for k, v in result["positions"].items()}
 node_bottom = max(p[1] - TITLE_HEIGHT + 80 + TITLE_HEIGHT for p in pos.values())
 parked = frames[1]
 assert parked[1] >= node_bottom, "parked frame must sit below the layout"
-assert (parked[2], parked[3]) == (240, 120), "parked frame keeps its size"
+# Snapping rounds frames outward, so each dimension may grow by <= grid.
+assert 240 <= parked[2] <= 250 and 120 <= parked[3] <= 130, \
+    f"parked frame should keep its size (mod outward snap): {parked}"
 print("stale group parking OK")
 
 # ---------------------------- LayoutSort trigger must not warp the layout
@@ -276,7 +278,7 @@ wf_04 = {
         "linkExtensions": [{"id": 5, "parentId": 2}],
     },
 }
-check_reroute_chain(compute_layout(wf_04))
+check_reroute_chain(compute_layout(wf_04, {"snap_grid": 0}))
 
 # schema v1: top-level reroutes + object links carrying parentId
 wf_v1 = {
@@ -288,11 +290,41 @@ wf_v1 = {
         {"id": 2, "parentId": 1, "pos": [600, 400], "linkIds": [5]},
     ],
 }
-check_reroute_chain(compute_layout(wf_v1))
+check_reroute_chain(compute_layout(wf_v1, {"snap_grid": 0}))
 print("reroutes OK")
 
+# --------------------------------------------- style: align / equalize / snap
+style_wf = {
+    "nodes": [
+        node(1, "A", [0, 0], [200, 80]),      # layer 0 (short column)
+        node(2, "C", [0, 500], [140, 300]),   # layer 0 (tall column)
+        node(3, "B", [900, 200], [200, 100]), # layer 1
+    ],
+    "links": [[1, 1, 0, 3, 0, "X"], [2, 2, 0, 3, 1, "X"]],
+}
+# align=top: every column starts at the same visual top edge.
+r_top = compute_layout(style_wf, {"align": "top", "snap_grid": 10})
+p = {int(k): v for k, v in r_top["positions"].items()}
+assert abs(p[1][1] - p[3][1]) < 1e-6, "top-aligned columns must share a top edge"
+for pos in p.values():
+    assert pos[0] % 10 == 0 and pos[1] % 10 == 0, f"not snapped: {pos}"
+# align=center: single-node column 3 centers against the taller column.
+r_center = compute_layout(style_wf, {"align": "center", "snap_grid": 0})
+pc = {int(k): v for k, v in r_center["positions"].items()}
+assert pc[3][1] > pc[1][1], "centered column should sit lower than the top edge"
+# equalize_widths: node 2 (140 wide) widens to its column mate's 200,
+# and starts at the same x as node 1.
+r_eq = compute_layout(style_wf, {"align": "top", "equalize_widths": True,
+                                 "snap_grid": 10})
+sizes = {int(k): v for k, v in r_eq["sizes"].items()}
+peq = {int(k): v for k, v in r_eq["positions"].items()}
+assert sizes.get(2, [0])[0] == 200 and sizes[2][1] == 300, sizes
+assert 1 not in sizes, "already-widest node must keep its size"
+assert abs(peq[1][0] - peq[2][0]) < 1e-6, "equalized column edges must align"
+print("style options OK")
+
 # ---------------------------------------------------------------- degenerate
-assert compute_layout({}) == {"positions": {}, "groups": [],
+assert compute_layout({}) == {"positions": {}, "sizes": {}, "groups": [],
                               "new_groups": [], "reroutes": {}}
 assert compute_layout({"nodes": [], "links": None})["positions"] == {}
 compute_layout({"nodes": [node(1, "Solo", {"0": 5, "1": 6}, {"0": 100, "1": 50})],

@@ -234,11 +234,23 @@ def _request_json(url, payload, timeout, api_key="", provider="openai"):
 
 def resolve_base_url(provider, base_url):
     """Turn the llm_provider dropdown value into an endpoint; "custom"
-    (or anything unknown) falls back to the llm_base_url text."""
-    preset = PROVIDER_PRESETS.get((provider or "").strip().lower())
+    (or anything unknown) falls back to the llm_base_url text.
+
+    Also heals workflows saved by older node versions, where positional
+    widget values shift one slot: a URL that landed in the provider slot
+    is used as the endpoint, and junk like "auto" in the base_url slot
+    falls back to the LM Studio default instead of becoming a fake
+    hostname (http://auto -> getaddrinfo failure)."""
+    provider = (provider or "").strip()
+    preset = PROVIDER_PRESETS.get(provider.lower())
     if preset:
         return preset
-    return (base_url or "").strip() or DEFAULT_BASE_URL
+    if re.match(r"^https?://", provider, re.IGNORECASE):
+        return provider
+    base = (base_url or "").strip()
+    if not base or base.lower() == "auto":
+        return DEFAULT_BASE_URL
+    return base
 
 
 def _provider_for(base_url):
@@ -296,7 +308,7 @@ def list_models(base_url=None, timeout=15, api_key="", key_origin="*"):
             return [], "the server reports no loaded models"
         return models, None
     except Exception as exc:
-        return [], f"{type(exc).__name__}: {exc}"
+        return [], f"{type(exc).__name__}: {exc} (endpoint: {base})"
 
 
 def _extract_json(text):
@@ -521,7 +533,7 @@ def suggest_clusters(workflow, base_url=None, model="", timeout=60,
         LOGGER.info("LLM suggested %d clusters via %s", len(clusters), model_id)
         return clusters, None
     except Exception as exc:  # degrade to a plain sort, never break it
-        message = f"{type(exc).__name__}: {exc}"
+        message = f"{type(exc).__name__}: {exc} (endpoint: {base})"
         if withheld and isinstance(exc, urllib.error.HTTPError) \
                 and exc.code in (401, 403):
             message += (" — the stored API key was withheld because this "
