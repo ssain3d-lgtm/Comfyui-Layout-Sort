@@ -141,11 +141,12 @@ async function sortNow(node) {
         v_spacing: widgetValue(node, "node_spacing", 40),
         group_mode: widgetValue(node, "group_mode", "cluster"),
     };
+    // The API key is deliberately absent here: it lives server-side only
+    // (key dialog / env var) and must never enter the graph or this payload.
     const llm = {
         enabled: widgetValue(node, "llm_clustering", false),
         base_url: widgetValue(node, "llm_base_url", ""),
         model: widgetValue(node, "llm_model", ""),
-        api_key: widgetValue(node, "llm_api_key", ""),
     };
     try {
         const res = await api.fetchApi("/layout_sort/compute", {
@@ -175,6 +176,114 @@ async function sortNow(node) {
     }
 }
 
+const KEY_BUTTON_UNSET = "🔑 LLM API key";
+const KEY_BUTTON_SET = "🔑 LLM API key ✓";
+
+function promptApiKey() {
+    // Masked input rendered locally; the value is sent once to the backend
+    // and never stored client-side (no widget, no localStorage, no graph).
+    return new Promise((resolve) => {
+        const overlay = document.createElement("div");
+        overlay.style.cssText =
+            "position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:10000;" +
+            "display:flex;align-items:center;justify-content:center";
+        const box = document.createElement("div");
+        box.style.cssText =
+            "background:#353535;color:#ddd;padding:20px;border-radius:8px;" +
+            "min-width:340px;font-family:sans-serif;font-size:13px";
+        box.innerHTML = `
+            <div style="margin-bottom:10px;font-weight:600">LLM API key</div>
+            <input type="password" placeholder="LM Studio 기본 설정은 비워두세요"
+                style="width:100%;padding:7px;box-sizing:border-box;background:#222;
+                       color:#eee;border:1px solid #555;border-radius:4px">
+            <div style="font-size:11px;margin-top:8px;opacity:.7;line-height:1.5">
+                서버에만 저장됩니다 — 워크플로우 JSON·PNG 메타데이터에는
+                절대 기록되지 않습니다.</div>
+            <div style="margin-top:14px;display:flex;gap:8px;justify-content:flex-end">
+                <button data-a="clear">Clear</button>
+                <button data-a="cancel">Cancel</button>
+                <button data-a="save">Save</button>
+            </div>`;
+        for (const btn of box.querySelectorAll("button")) {
+            btn.style.cssText =
+                "padding:5px 14px;border-radius:4px;border:1px solid #555;" +
+                "background:#444;color:#eee;cursor:pointer";
+        }
+        const input = box.querySelector("input");
+        const close = (result) => {
+            overlay.remove();
+            resolve(result);
+        };
+        box.addEventListener("click", (e) => {
+            const action = e.target?.dataset?.a;
+            if (action === "save") close({ key: input.value.trim() });
+            else if (action === "clear") close({ key: "" });
+            else if (action === "cancel") close(null);
+        });
+        input.addEventListener("keydown", (e) => {
+            if (e.key === "Enter") close({ key: input.value.trim() });
+            else if (e.key === "Escape") close(null);
+        });
+        overlay.addEventListener("click", (e) => {
+            if (e.target === overlay) close(null);
+        });
+        overlay.appendChild(box);
+        document.body.appendChild(overlay);
+        input.focus();
+    });
+}
+
+function keyButton(node) {
+    return node.widgets?.find(
+        (w) => w.name === KEY_BUTTON_UNSET || w.name === KEY_BUTTON_SET);
+}
+
+async function refreshKeyStatus(node) {
+    try {
+        const res = await api.fetchApi("/layout_sort/api_key");
+        if (!res.ok) return;
+        const status = await res.json();
+        const button = keyButton(node);
+        if (button) {
+            button.name = status.configured ? KEY_BUTTON_SET : KEY_BUTTON_UNSET;
+            node.setDirtyCanvas?.(true, false);
+        }
+    } catch (err) {
+        console.warn("[LayoutSort] key status unavailable:", err);
+    }
+}
+
+async function manageApiKey(node) {
+    const result = await promptApiKey();
+    if (!result) return;
+    try {
+        const res = await api.fetchApi("/layout_sort/api_key", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ api_key: result.key }),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const status = await res.json();
+        app.extensionManager?.toast?.add?.({
+            severity: "success",
+            summary: "Layout Sort",
+            detail: status.configured
+                ? "API key saved on the server (never written into workflows)."
+                : "API key cleared.",
+            life: 4000,
+        });
+    } catch (err) {
+        console.error("[LayoutSort] saving API key failed:", err);
+        app.extensionManager?.toast?.add?.({
+            severity: "error",
+            summary: "Layout Sort",
+            detail: `Saving API key failed: ${err}`,
+            life: 6000,
+        });
+    }
+    refreshKeyStatus(node);
+}
+
 app.registerExtension({
     name: "comfyui.layout.sort",
     setup() {
@@ -187,6 +296,8 @@ app.registerExtension({
             onNodeCreated?.apply(this, arguments);
             // Instant sort without queueing the workflow.
             this.addWidget("button", "✨ Sort now", null, () => sortNow(this));
+            this.addWidget("button", KEY_BUTTON_UNSET, null, () => manageApiKey(this));
+            refreshKeyStatus(this);
         };
     },
 });

@@ -43,7 +43,9 @@ ComfyUI를 재시작하면 `utils/layout` 카테고리에 **Layout Sort (Auto Ar
 | `llm_clustering` | `false` | 로컬 LLM으로 그룹 없는 노드를 기능별 클러스터링 (아래 참조) |
 | `llm_base_url` | `http://127.0.0.1:1234/v1` | OpenAI 호환 엔드포인트 (LM Studio 기본값) |
 | `llm_model` | (빈 값) | 모델 ID. 비워두면 서버에 로드된 첫 모델 자동 선택 |
-| `llm_api_key` | (빈 값) | 선택. Bearer 토큰이 필요한 서버용 (아래 참조) |
+
+API 토큰은 보안상 위젯이 아니라 노드의 **🔑 LLM API key** 버튼으로
+관리합니다 (아래 참조).
 
 ### 그룹 처리 (`group_mode`)
 
@@ -74,17 +76,25 @@ ComfyUI를 재시작하면 `utils/layout` 카테고리에 **Layout Sort (Auto Ar
 2. Layout Sort 노드에서 `llm_clustering`을 `true`로 바꾸고 정렬을 실행합니다.
    Ollama 등 다른 OpenAI 호환 서버는 `llm_base_url`만 바꾸면 됩니다.
 
-**API 토큰**: LM Studio 로컬 서버는 기본 설정에서 토큰 없이 동작합니다
-(비워두면 됩니다). LM Studio에 API 키를 설정해뒀거나, 인증이 필요한
-프록시/원격 서버·OpenRouter 등을 쓸 때는 두 가지 방법으로 토큰을 넣을 수
-있습니다:
+**API 토큰**: LM Studio 로컬 서버는 기본 설정에서 토큰 없이 동작합니다.
+LM Studio에 API 키를 설정해뒀거나 인증이 필요한 프록시/원격 서버·OpenRouter
+등을 쓸 때만 토큰이 필요합니다.
 
-- `llm_api_key` 위젯에 입력 — 간편하지만 **위젯 값은 워크플로우 JSON과
-  생성 이미지 PNG 메타데이터에 저장되므로**, 워크플로우를 공유한다면
-  토큰이 함께 유출됩니다.
-- 환경변수 `LAYOUT_SORT_LLM_API_KEY` 설정 — ComfyUI 실행 전에 설정해두면
-  위젯을 비워둔 채 안전하게 사용됩니다 (권장). 위젯 값이 있으면 위젯이
-  우선합니다.
+토큰은 **의도적으로 노드 위젯이 아닙니다** — ComfyUI 위젯 값은 워크플로우
+JSON과 생성 이미지 PNG 메타데이터에 저장되어 공유 시 그대로 유출되기
+때문입니다. 대신:
+
+- 노드의 **🔑 LLM API key** 버튼 → 마스킹된 입력창에 키 입력 → 서버 측
+  파일에만 저장됩니다 (기본 위치: ComfyUI `user/` 디렉토리, 파일 권한
+  600, `LAYOUT_SORT_KEY_FILE` 환경변수로 경로 변경 가능). 그래프·PNG·
+  브라우저 저장소 어디에도 기록되지 않고, 키를 되돌려주는 API도 없습니다
+  (설정 여부만 조회 가능). 버튼에 ✓가 붙으면 설정된 상태입니다.
+- 또는 환경변수 `LAYOUT_SORT_LLM_API_KEY` — ComfyUI 실행 전에 설정.
+  우선순위는 저장 파일 > 환경변수입니다.
+
+알아둘 점: ComfyUI 포트에 접근할 수 있는 사람은 (ComfyUI 특성상 원래
+모든 기능을 쓸 수 있으므로) 키를 새로 덮어쓰거나 LLM 호출에 사용할 수는
+있습니다. 다만 저장된 키를 읽어갈 수는 없습니다.
 
 동작 규칙:
 

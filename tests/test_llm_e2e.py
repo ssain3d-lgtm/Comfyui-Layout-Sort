@@ -454,6 +454,52 @@ def case_api_key():
     assert auths and all(a == "Bearer sk-from-env" for a in auths), auths
 
 
+@case("11. server-side key store: file used, explicit beats file, clear works")
+def case_key_store():
+    import os
+    import tempfile
+
+    handle = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
+    handle.close()
+    os.environ[layout_sort.KEY_FILE_ENV_VAR] = handle.name
+    try:
+        # Stored key reaches the server as a Bearer header via run_layout.
+        layout_sort.store_api_key("sk-stored")
+        assert layout_sort.load_stored_api_key() == "sk-stored"
+        if os.name == "posix":
+            mode = os.stat(handle.name).st_mode & 0o777
+            assert mode == 0o600, f"key file should be 0600, got {oct(mode)}"
+        SERVER.reset()
+        SERVER.chat_content = CONTENT_HAPPY
+        res = layout_sort.run_layout(
+            make_workflow(), {"group_mode": "cluster"},
+            {"enabled": True, "base_url": BASE, "model": ""})
+        assert res["llm"]["used"] is True, res["llm"]
+        auths = [r["auth"] for r in SERVER.snapshot()]
+        assert auths and all(a == "Bearer sk-stored" for a in auths), auths
+
+        # An explicit key from a programmatic caller wins over the file.
+        SERVER.reset()
+        SERVER.chat_content = CONTENT_HAPPY
+        layout_sort.run_layout(
+            make_workflow(), {"group_mode": "cluster"},
+            {"enabled": True, "base_url": BASE, "model": "",
+             "api_key": "sk-explicit"})
+        auths = [r["auth"] for r in SERVER.snapshot()]
+        assert auths and all(a == "Bearer sk-explicit" for a in auths), auths
+
+        # Clearing removes the file and the header.
+        layout_sort.store_api_key("")
+        assert layout_sort.load_stored_api_key() == ""
+        assert not os.path.exists(handle.name), "clear must delete the file"
+    finally:
+        os.environ.pop(layout_sort.KEY_FILE_ENV_VAR, None)
+        try:
+            os.unlink(handle.name)
+        except OSError:
+            pass
+
+
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------

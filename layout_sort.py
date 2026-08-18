@@ -15,12 +15,61 @@ LLM failure falls back to a plain sort.
 """
 
 import asyncio
+import os
 
 from .layout_core import compute_layout
 from .llm_client import DEFAULT_BASE_URL, suggest_clusters
 
 WS_EVENT = "layout_sort_apply"
 LLM_TIMEOUT_SECONDS = 120
+
+# The API key is intentionally NOT a node widget: widget values get
+# serialized into workflow JSON and PNG metadata, leaking the secret with
+# every shared file. Instead it lives server-side only — in a file set via
+# the node's key dialog (or the LAYOUT_SORT_LLM_API_KEY env var).
+KEY_FILE_ENV_VAR = "LAYOUT_SORT_KEY_FILE"
+KEY_FILE_NAME = "layout_sort_llm_api_key.txt"
+MAX_KEY_LENGTH = 4096
+
+
+def _key_file_path():
+    override = os.environ.get(KEY_FILE_ENV_VAR, "").strip()
+    if override:
+        return override
+    try:
+        import folder_paths
+        base = folder_paths.get_user_directory()
+    except Exception:
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, KEY_FILE_NAME)
+
+
+def load_stored_api_key():
+    try:
+        with open(_key_file_path(), "r", encoding="utf-8") as handle:
+            return handle.read().strip()
+    except OSError:
+        return ""
+
+
+def store_api_key(key):
+    """Persist (or clear, for empty keys) the server-side API key."""
+    path = _key_file_path()
+    if not key:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(key)
+    try:
+        os.chmod(path, 0o600)  # owner-only where the OS supports it
+    except OSError:
+        pass
 
 
 def run_layout(workflow, options, llm_cfg=None):
@@ -34,12 +83,14 @@ def run_layout(workflow, options, llm_cfg=None):
         llm_info = {"used": False,
                     "error": 'group_mode must be "cluster" for LLM clustering'}
     elif use_llm:
+        # Priority: explicit (programmatic callers) > stored file > env var
+        # (the env fallback lives inside suggest_clusters).
         clusters, error = suggest_clusters(
             workflow,
             base_url=llm_cfg.get("base_url") or DEFAULT_BASE_URL,
             model=llm_cfg.get("model") or "",
             timeout=LLM_TIMEOUT_SECONDS,
-            api_key=llm_cfg.get("api_key") or "",
+            api_key=llm_cfg.get("api_key") or load_stored_api_key(),
         )
         if error:
             llm_info = {"used": False, "error": error}
@@ -91,14 +142,53 @@ else:
             return web.json_response({"error": str(exc)}, status=500)
         return web.json_response(result)
 
+    def _key_status():
+        from .llm_client import API_KEY_ENV_VAR
+        if load_stored_api_key():
+            source = "file"
+        elif os.environ.get(API_KEY_ENV_VAR, "").strip():
+            source = "env"
+        else:
+            source = "none"
+        # Status only — the key itself is never sent back to any client.
+        return web.json_response(
+            {"configured": source != "none", "source": source}
+        )
+
+    async def _layout_sort_key_get(_request):
+        return _key_status()
+
+    async def _layout_sort_key_set(request):
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid json"}, status=400)
+        if not isinstance(data, dict):
+            return web.json_response({"error": "body must be an object"},
+                                     status=400)
+        key = str(data.get("api_key") or "").strip()
+        if len(key) > MAX_KEY_LENGTH:
+            return web.json_response({"error": "key too long"}, status=400)
+        try:
+            store_api_key(key)
+        except OSError as exc:
+            return web.json_response({"error": str(exc)}, status=500)
+        return _key_status()
+
     try:
         PromptServer.instance.routes.post("/layout_sort/compute")(
             _layout_sort_compute
         )
-    except Exception as exc:  # keep the node usable even if the route fails
+        PromptServer.instance.routes.get("/layout_sort/api_key")(
+            _layout_sort_key_get
+        )
+        PromptServer.instance.routes.post("/layout_sort/api_key")(
+            _layout_sort_key_set
+        )
+    except Exception as exc:  # keep the node usable even if the routes fail
         import logging
         logging.getLogger("ComfyUI-Layout-Sort").warning(
-            "could not register /layout_sort/compute: %s", exc
+            "could not register /layout_sort routes: %s", exc
         )
 
 
@@ -168,16 +258,6 @@ class LayoutSort:
                      "tooltip": "Model id to use. Leave empty to use the "
                                 "first model loaded in the server."},
                 ),
-                "llm_api_key": (
-                    "STRING",
-                    {"default": "",
-                     "tooltip": "Optional Bearer token. LM Studio needs none "
-                                "by default. CAUTION: widget values are saved "
-                                "into workflows and PNG metadata — for shared "
-                                "workflows set the LAYOUT_SORT_LLM_API_KEY "
-                                "environment variable instead and leave this "
-                                "empty."},
-                ),
             },
             "optional": {
                 "trigger": (
@@ -198,7 +278,7 @@ class LayoutSort:
         return float("nan")
 
     def sort(self, direction, layer_spacing, node_spacing, group_mode, animate,
-             llm_clustering, llm_base_url, llm_model, llm_api_key,
+             llm_clustering, llm_base_url, llm_model,
              trigger=None, extra_pnginfo=None, unique_id=None):
         workflow = (extra_pnginfo or {}).get("workflow")
         server = getattr(PromptServer, "instance", None) if PromptServer else None
@@ -216,7 +296,6 @@ class LayoutSort:
                 "enabled": llm_clustering,
                 "base_url": llm_base_url,
                 "model": llm_model,
-                "api_key": llm_api_key,
             },
         )
         # Target the client that queued this prompt; fall back to broadcast.
