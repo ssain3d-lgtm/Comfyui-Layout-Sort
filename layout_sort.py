@@ -23,7 +23,13 @@ import json
 import os
 import tempfile
 
-from .layout_core import compute_layout
+from .layout_core import (
+    _center,
+    _group_contains,
+    _normalize_groups,
+    _normalize_nodes,
+    compute_layout,
+)
 from .llm_client import (
     DEFAULT_BASE_URL,
     format_origin,
@@ -136,6 +142,53 @@ def store_api_key(key, allowed_origin=None):
         pass
 
 
+def _scoped_workflow(workflow, scope_ids):
+    """A copy of the workflow reduced to the selected nodes.
+
+    Keeps links whose both endpoints are selected, and group frames whose
+    every member (by the engine's center-containment rule) is selected —
+    a partially selected group's frame stays untouched and its selected
+    members sort as loose nodes. Returns (scoped_workflow, index_map)
+    where index_map translates scoped group indices back to the original
+    workflow's group indices.
+    """
+    ids = {str(v) for v in scope_ids}
+    all_nodes = _normalize_nodes(workflow)
+    kept_nodes = [
+        raw for raw in workflow.get("nodes") or []
+        if isinstance(raw, dict) and str(raw.get("id")) in ids
+    ]
+    kept_ids = {str(raw.get("id")) for raw in kept_nodes}
+
+    kept_links = []
+    for raw in workflow.get("links") or []:
+        if isinstance(raw, (list, tuple)) and len(raw) >= 5:
+            origin, target = raw[1], raw[3]
+        elif isinstance(raw, dict):
+            origin, target = raw.get("origin_id"), raw.get("target_id")
+        else:
+            continue
+        if str(origin) in kept_ids and str(target) in kept_ids:
+            kept_links.append(raw)
+
+    kept_groups, index_map = [], {}
+    raw_groups = workflow.get("groups") or []
+    for group in _normalize_groups(workflow):
+        members = [
+            nid for nid, node in all_nodes.items()
+            if _group_contains(group, *_center(node))
+        ]
+        if members and all(str(nid) in kept_ids for nid in members):
+            index_map[len(kept_groups)] = group["index"]
+            kept_groups.append(raw_groups[group["index"]])
+
+    scoped = dict(workflow)
+    scoped["nodes"] = kept_nodes
+    scoped["links"] = kept_links
+    scoped["groups"] = kept_groups
+    return scoped, index_map
+
+
 def run_layout(workflow, options, llm_cfg=None):
     """Shared pipeline for the node and the HTTP route.
 
@@ -143,7 +196,12 @@ def run_layout(workflow, options, llm_cfg=None):
     request into validated engine options (which win over the widget
     values for this run) and optional named clusters; geometry itself is
     always computed deterministically. An empty prompt — or any LLM
-    failure — is a plain sort with the widget settings."""
+    failure — is a plain sort with the widget settings.
+
+    options["scope_ids"] (node id list) restricts the sort to a
+    selection: only those nodes move, anchored where the selection sits,
+    and everything else — including partially selected group frames — is
+    left exactly as it was."""
     if not workflow.get("nodes") and any(
         isinstance(v, dict) and "class_type" in v
         for v in workflow.values() if isinstance(v, dict)
@@ -155,6 +213,11 @@ def run_layout(workflow, options, llm_cfg=None):
             "data); load it into ComfyUI and sort the live graph instead"
         )
     options = dict(options or {})
+    full_group_count = len(workflow.get("groups") or [])
+    scope_ids = options.pop("scope_ids", None)
+    group_index_map = None
+    if scope_ids:
+        workflow, group_index_map = _scoped_workflow(workflow, scope_ids)
     extra_clusters = None
     llm_info = None
     prompt = str((llm_cfg or {}).get("prompt") or "").strip()
@@ -199,10 +262,18 @@ def run_layout(workflow, options, llm_cfg=None):
         options = {**style,
                    **{k: v for k, v in options.items() if v is not None}}
     result = compute_layout(workflow, options, extra_clusters)
+    if group_index_map is not None:
+        # Scoped copies renumber groups from 0; translate frame updates
+        # back to the live graph's group indices.
+        result["groups"] = [
+            {**u, "index": group_index_map[u["index"]]}
+            for u in result.get("groups") or []
+            if u["index"] in group_index_map
+        ]
     # Frame updates are index-based; the frontend compares this against
     # the live graph so frames added/removed during a slow LLM round-trip
     # can never receive another frame's geometry.
-    result["group_count"] = len(workflow.get("groups") or [])
+    result["group_count"] = full_group_count
     if llm_info and llm_info.get("used") and extra_clusters:
         # Report what actually got created: geometric filtering inside
         # compute_layout (existing groups win) can drop suggestions.

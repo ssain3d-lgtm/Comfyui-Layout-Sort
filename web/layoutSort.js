@@ -183,12 +183,153 @@ function applyLayout({ positions, groups, new_groups, reroutes, llm, animate,
 }
 
 function widgetValue(node, name, fallback) {
-    return node.widgets?.find((w) => w.name === name)?.value ?? fallback;
+    return node?.widgets?.find((w) => w.name === name)?.value ?? fallback;
+}
+
+function isGroupItem(item) {
+    return typeof item?.recomputeInsideNodes === "function";
+}
+
+function selectedNodes() {
+    // Selected nodes across frontend generations: the legacy
+    // selected_nodes map and the newer selectedItems set (which mixes
+    // nodes and group frames).
+    const canvas = app.canvas;
+    const found = new Map();
+    const sel = canvas?.selected_nodes;
+    if (sel) {
+        for (const key of Object.keys(sel)) {
+            const n = sel[key];
+            if (n?.id != null) found.set(n.id, n);
+        }
+    }
+    canvas?.selectedItems?.forEach?.((item) => {
+        if (!isGroupItem(item) && item?.id != null && item.pos) {
+            found.set(item.id, item);
+        }
+    });
+    return [...found.values()];
+}
+
+function selectionScope() {
+    // Node ids the sort should be limited to: every selected node plus
+    // the members of every selected group frame.
+    const ids = new Set(selectedNodes().map((n) => n.id));
+    app.canvas?.selectedItems?.forEach?.((item) => {
+        if (!isGroupItem(item)) return;
+        try {
+            item.recomputeInsideNodes();
+        } catch (err) { /* membership stays as last computed */ }
+        for (const n of item._nodes ?? item.nodes ?? []) {
+            if (n?.id != null) ids.add(n.id);
+        }
+    });
+    return [...ids];
+}
+
+// --- pure geometry for the align/distribute tools (extracted by tests) ---
+// rects: [{id, x, y, w, h}] visual bounds. Returns {id: [dx, dy]}.
+function computeAlignDeltas(rects, op) {
+    if (rects.length < 2) return {};
+    const minX = Math.min(...rects.map((r) => r.x));
+    const maxR = Math.max(...rects.map((r) => r.x + r.w));
+    const minY = Math.min(...rects.map((r) => r.y));
+    const maxB = Math.max(...rects.map((r) => r.y + r.h));
+    const deltas = {};
+    for (const r of rects) {
+        let dx = 0;
+        let dy = 0;
+        if (op === "left") dx = minX - r.x;
+        else if (op === "right") dx = maxR - (r.x + r.w);
+        else if (op === "top") dy = minY - r.y;
+        else if (op === "bottom") dy = maxB - (r.y + r.h);
+        else if (op === "center_h") dx = (minX + maxR) / 2 - (r.x + r.w / 2);
+        else if (op === "center_v") dy = (minY + maxB) / 2 - (r.y + r.h / 2);
+        deltas[r.id] = [Math.round(dx), Math.round(dy)];
+    }
+    return deltas;
+}
+
+function computeDistributeDeltas(rects, axis) {
+    // Equal GAPS between visual rects (not equal centers); the outermost
+    // two stay fixed. axis: "h" | "v".
+    if (rects.length < 3) return {};
+    const pos = axis === "h" ? "x" : "y";
+    const len = axis === "h" ? "w" : "h";
+    const ordered = [...rects].sort((a, b) => a[pos] - b[pos]);
+    const first = ordered[0];
+    const last = ordered[ordered.length - 1];
+    const span = last[pos] + last[len] - first[pos];
+    const total = ordered.reduce((sum, r) => sum + r[len], 0);
+    const gap = (span - total) / (ordered.length - 1);
+    const deltas = {};
+    let cursor = first[pos];
+    for (const r of ordered) {
+        const d = Math.round(cursor - r[pos]);
+        deltas[r.id] = axis === "h" ? [d, 0] : [0, d];
+        cursor += r[len] + gap;
+    }
+    return deltas;
+}
+// --- end pure geometry ---
+
+function visualBound(node) {
+    if (typeof node.getBounding === "function") {
+        const b = node.getBounding();
+        return { id: node.id, x: b[0], y: b[1], w: b[2], h: b[3] };
+    }
+    return { id: node.id, x: node.pos[0], y: node.pos[1] - 30,
+             w: node.size[0], h: node.size[1] + 30 };
+}
+
+function toolToast(detail, severity = "info") {
+    app.extensionManager?.toast?.add?.({
+        severity, summary: "Layout Sort", detail, life: 3000,
+    });
+}
+
+function applyDeltas(nodes, deltas) {
+    if (!Object.keys(deltas).length) return false;
+    app.graph.beforeChange?.();
+    for (const n of nodes) {
+        const d = deltas[n.id];
+        if (!d) continue;
+        n.pos[0] += d[0];
+        n.pos[1] += d[1];
+    }
+    app.graph.afterChange?.();
+    app.graph.setDirtyCanvas(true, true);
+    return true;
+}
+
+function alignSelected(op) {
+    const nodes = selectedNodes();
+    if (nodes.length < 2) {
+        toolToast("Select 2+ nodes to align.");
+        return;
+    }
+    applyDeltas(nodes, computeAlignDeltas(nodes.map(visualBound), op));
+}
+
+function distributeSelected(axis) {
+    const nodes = selectedNodes();
+    if (nodes.length < 3) {
+        toolToast("Select 3+ nodes to distribute.");
+        return;
+    }
+    applyDeltas(nodes, computeDistributeDeltas(nodes.map(visualBound), axis));
+}
+
+function findSortNode() {
+    return app.graph?._nodes?.find((n) => n.type === NODE_NAME) ?? null;
 }
 
 async function sortNow(node) {
-    if (node.__layoutSortBusy) return;
-    node.__layoutSortBusy = true;
+    // Also runs from the command palette with no LayoutSort node on the
+    // canvas (node = null): widget reads fall back to defaults.
+    const busyHolder = node ?? sortNow;
+    if (busyHolder.__layoutSortBusy) return;
+    busyHolder.__layoutSortBusy = true;
     const workflow = app.graph.serialize();
     const options = {
         direction: widgetValue(node, "direction", "left_to_right"),
@@ -197,6 +338,10 @@ async function sortNow(node) {
         group_mode: widgetValue(node, "group_mode", "cluster"),
         style: widgetValue(node, "style", "flow"),
     };
+    // 2+ selected nodes (or selected group frames) = sort only those,
+    // anchored where the selection sits; everything else stays put.
+    const scope = selectionScope();
+    if (scope.length >= 2) options.scope_ids = scope;
     // The API key is deliberately absent here: it lives server-side only
     // (key dialog / env var) and must never enter the graph or this payload.
     const llm = {
@@ -223,6 +368,10 @@ async function sortNow(node) {
             animate: widgetValue(node, "animate", true),
             group_count: result.group_count,
         });
+        if (options.scope_ids) {
+            const moved = Object.keys(result.positions ?? {}).length;
+            toolToast(`Sorted ${moved} selected node(s); the rest stayed put.`);
+        }
     } catch (err) {
         console.error("[LayoutSort] sort request failed:", err);
         app.extensionManager?.toast?.add?.({
@@ -232,7 +381,7 @@ async function sortNow(node) {
             life: 6000,
         });
     } finally {
-        node.__layoutSortBusy = false;
+        busyHolder.__layoutSortBusy = false;
     }
 }
 
@@ -478,6 +627,42 @@ async function connectModels(node) {
 
 app.registerExtension({
     name: "comfyui.layout.sort",
+    // All ops live in the command palette and are rebindable in ComfyUI's
+    // keybinding settings; three ship with defaults that avoid the stock
+    // shortcuts.
+    commands: [
+        { id: "layoutSort.sort",
+          label: "Layout Sort: sort selection (or whole graph)",
+          function: () => sortNow(findSortNode()) },
+        { id: "layoutSort.alignLeft", label: "Layout Sort: align left",
+          function: () => alignSelected("left") },
+        { id: "layoutSort.alignRight", label: "Layout Sort: align right",
+          function: () => alignSelected("right") },
+        { id: "layoutSort.alignTop", label: "Layout Sort: align top",
+          function: () => alignSelected("top") },
+        { id: "layoutSort.alignBottom", label: "Layout Sort: align bottom",
+          function: () => alignSelected("bottom") },
+        { id: "layoutSort.centerHorizontal",
+          label: "Layout Sort: center on vertical axis",
+          function: () => alignSelected("center_h") },
+        { id: "layoutSort.centerVertical",
+          label: "Layout Sort: center on horizontal axis",
+          function: () => alignSelected("center_v") },
+        { id: "layoutSort.distributeHorizontal",
+          label: "Layout Sort: distribute horizontally (equal gaps)",
+          function: () => distributeSelected("h") },
+        { id: "layoutSort.distributeVertical",
+          label: "Layout Sort: distribute vertically (equal gaps)",
+          function: () => distributeSelected("v") },
+    ],
+    keybindings: [
+        { combo: { key: "s", alt: true, shift: true },
+          commandId: "layoutSort.sort" },
+        { combo: { key: "h", alt: true, shift: true },
+          commandId: "layoutSort.distributeHorizontal" },
+        { combo: { key: "v", alt: true, shift: true },
+          commandId: "layoutSort.distributeVertical" },
+    ],
     setup() {
         api.addEventListener(WS_EVENT, ({ detail }) => applyLayout(detail ?? {}));
     },

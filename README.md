@@ -33,6 +33,21 @@ ComfyUI를 재시작하면 `utils/layout` 카테고리에 **Layout Sort (Auto Ar
    정리됩니다. `trigger` 입력(모든 타입 허용)에 아무 출력이나 연결하면 해당 노드
    이후에 실행되도록 순서를 제어할 수 있습니다.
 
+### 선택만 정렬 · 정렬/분배 도구 · 단축키
+
+- **선택 범위만 정렬** — 노드 2개 이상(또는 그룹 프레임)을 선택한 상태에서
+  Sort를 실행하면 **선택된 것만** 제자리에서 정렬되고 나머지는 전혀 움직이지
+  않습니다. 그룹 프레임을 선택하면 그 멤버 전체가 범위에 들어가고, 그룹이
+  **통째로** 선택된 경우에만 프레임도 다시 감싸집니다(일부만 선택된 그룹의
+  프레임은 건드리지 않음). 선택이 없으면 기존처럼 전체 정렬입니다.
+- **정렬/분배 도구** — 선택 노드들에 대해 좌/우/상/하 정렬, 세로·가로 축
+  중앙 정렬, 그리고 **간격 균등 분배**(양 끝 고정, 시각적 간격 동일) 8종.
+  각 동작은 Ctrl+Z 1회로 되돌립니다.
+- **단축키** — 기본 배정: `Alt+Shift+S` 정렬(선택 우선), `Alt+Shift+H`
+  가로 균등 분배, `Alt+Shift+V` 세로 균등 분배. 나머지 동작까지 전부
+  ComfyUI **명령 팔레트**에 "Layout Sort: ..."로 등록되어 있어 검색 실행
+  및 키 재배정(Settings → Keybinding)이 가능합니다.
+
 ### 옵션 (Options)
 
 | 옵션 | 기본값 | 설명 |
@@ -228,9 +243,12 @@ JSON과 생성 이미지 PNG 메타데이터에 저장되어 공유 시 그대�
 그룹 경계에 걸친 노드 0. 테스트는 `tests/`에 있으며 ComfyUI 없이 실행됩니다:
 
 ```bash
-python3 tests/test_layout.py    # 레이아웃 엔진 (NaN 방어, 그룹 주차 포함)
-python3 tests/test_llm_e2e.py   # 목(mock) 서버로 프롬프트 계획 경로 E2E
-python3 tests/test_routes.py    # aiohttp 라우트 계층 (키 저장/검증 포함)
+python3 tests/test_layout.py             # 레이아웃 엔진 (NaN 방어, 그룹 주차, 멱등성)
+python3 tests/test_llm_e2e.py            # 목(mock) 서버로 프롬프트 계획 경로 E2E
+python3 tests/test_prompt_directives.py  # 프롬프트 지시 경우의수 전수 이행 매트릭스
+python3 tests/test_scoped_sort.py        # 선택 범위 정렬
+python3 tests/test_routes.py             # aiohttp 라우트 계층 (키 저장/검증 포함)
+node tests/test_frontend_tools.mjs       # 정렬/분배 도구 기하학
 ```
 
 ## FAQ
