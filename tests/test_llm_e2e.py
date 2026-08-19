@@ -810,6 +810,44 @@ def case_malformed_plan_values():
     assert layout_sort.run_layout(make_workflow(), {})["group_count"] == 0
 
 
+@case("20. progress callback: stage order, and it may never break the sort")
+def case_progress_stages():
+    SERVER.reset()
+    SERVER.chat_content = CONTENT_HAPPY
+    stages = []
+    res = layout_sort.run_layout(
+        make_workflow(), {}, {"prompt": PROMPT, "base_url": BASE,
+                              "model": ""},
+        progress=stages.append)
+    assert stages == ["llm_request", "llm_done", "layout"], stages
+    assert res["llm"]["used"] is True
+
+    # No prompt: geometry stage only, still no HTTP.
+    stages = []
+    layout_sort.run_layout(make_workflow(), {}, {"prompt": ""},
+                           progress=stages.append)
+    assert stages == ["layout"], stages
+
+    # LLM failure still reports llm_done before falling back.
+    SERVER.reset()
+    SERVER.chat_content = "no json here"
+    stages = []
+    res = layout_sort.run_layout(
+        make_workflow(), {}, {"prompt": PROMPT, "base_url": BASE,
+                              "model": ""},
+        progress=stages.append)
+    assert stages == ["llm_request", "llm_done", "layout"], stages
+    assert res["llm"]["used"] is False
+
+    # A raising callback must not break the sort.
+    def boom(_stage):
+        raise RuntimeError("ui went away")
+
+    res = layout_sort.run_layout(make_workflow(), {}, None, progress=boom)
+    assert set(res["positions"]) == {str(n["id"])
+                                     for n in make_workflow()["nodes"]}
+
+
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------

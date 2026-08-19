@@ -2,7 +2,14 @@ import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 
 const WS_EVENT = "layout_sort_apply";
+const PROGRESS_EVENT = "layout_sort_progress";
 const NODE_NAME = "LayoutSort";
+const SORT_BUTTON = "✨ Sort now";
+const PROGRESS_STAGES = {
+    llm_request: "Asking the LLM",
+    llm_done: "Plan received",
+    layout: "Computing layout",
+};
 const GROUP_COLORS = ["#3f789e", "#88677a", "#6b8a5e", "#8a7a4e", "#7a6b9e", "#5e8a8a"];
 
 function findNode(id) {
@@ -324,12 +331,64 @@ function findSortNode() {
     return app.graph?._nodes?.find((n) => n.type === NODE_NAME) ?? null;
 }
 
+// A sort in flight turns the node's Sort button into a live progress
+// label — stage + elapsed seconds — so a slow LLM round-trip (up to
+// 2 min) never looks stuck. True percentages are impossible (an LLM's
+// remaining time is unknowable), but stage + elapsed is honest.
+let progressState = null;
+
+function renderProgress() {
+    if (!progressState?.button) return;
+    const seconds =
+        Math.floor((performance.now() - progressState.startedAt) / 1000);
+    progressState.button.name = `⏳ ${progressState.stage}… ${seconds}s`;
+    progressState.node?.setDirtyCanvas?.(true, false);
+}
+
+function beginProgress(node, hasPrompt) {
+    const button =
+        node?.widgets?.find((w) => w.name === SORT_BUTTON) ?? null;
+    progressState = {
+        node,
+        button,
+        stage: hasPrompt ? PROGRESS_STAGES.llm_request : "Sorting",
+        startedAt: performance.now(),
+        timer: button ? setInterval(renderProgress, 500) : null,
+    };
+    if (button) renderProgress();
+    else if (hasPrompt) {
+        // Command-palette run with no LayoutSort node to write on.
+        toolToast("Asking the LLM… this can take a while.");
+    }
+}
+
+function endProgress() {
+    if (!progressState) return;
+    if (progressState.timer) clearInterval(progressState.timer);
+    if (progressState.button) {
+        progressState.button.name = SORT_BUTTON;
+        progressState.node?.setDirtyCanvas?.(true, false);
+    }
+    progressState = null;
+}
+
+function onProgressEvent(stage) {
+    if (!progressState) return; // another tab's sort — not ours
+    const label = PROGRESS_STAGES[stage];
+    if (label) {
+        progressState.stage = label;
+        renderProgress();
+    }
+}
+
 async function sortNow(node) {
     // Also runs from the command palette with no LayoutSort node on the
     // canvas (node = null): widget reads fall back to defaults.
     const busyHolder = node ?? sortNow;
     if (busyHolder.__layoutSortBusy) return;
     busyHolder.__layoutSortBusy = true;
+    beginProgress(node,
+        String(widgetValue(node, "llm_prompt", "")).trim().length > 0);
     const workflow = app.graph.serialize();
     const options = {
         direction: widgetValue(node, "direction", "left_to_right"),
@@ -381,6 +440,7 @@ async function sortNow(node) {
             life: 6000,
         });
     } finally {
+        endProgress();
         busyHolder.__layoutSortBusy = false;
     }
 }
@@ -665,6 +725,8 @@ app.registerExtension({
     ],
     setup() {
         api.addEventListener(WS_EVENT, ({ detail }) => applyLayout(detail ?? {}));
+        api.addEventListener(PROGRESS_EVENT,
+            ({ detail }) => onProgressEvent(detail?.stage));
     },
     beforeRegisterNodeDef(nodeType, nodeData) {
         if (nodeData?.name !== NODE_NAME) return;
@@ -673,7 +735,7 @@ app.registerExtension({
             onNodeCreated?.apply(this, arguments);
             syncProviderUrl(this);
             // Instant sort without queueing the workflow.
-            this.addWidget("button", "✨ Sort now", null, () => sortNow(this));
+            this.addWidget("button", SORT_BUTTON, null, () => sortNow(this));
             this.addWidget("button", "🔌 Connect (load models)", null,
                 () => connectModels(this));
             this.addWidget("button", KEY_BUTTON_UNSET, null, () => manageApiKey(this));

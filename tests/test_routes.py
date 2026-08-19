@@ -109,9 +109,15 @@ def main():
 
     workflow = {"nodes": [{"id": 1, "type": "A", "pos": [0, 0],
                            "size": [100, 50], "flags": {}}], "links": []}
+    # The compute route relays run_layout progress stages over the
+    # websocket so the frontend can show what the wait is spent on.
+    sent = []
+    layout_sort.PromptServer.instance.send_sync = \
+        lambda event, payload, *a, **k: sent.append((event, payload))
     r = call("POST", "/layout_sort/compute", FakeRequest(body={"workflow": workflow}))
     assert r.status == 200 and set(r.data["positions"]) == {"1"}, (r.status, r.data)
     assert r.data["group_count"] == 0, r.data
+    assert ("layout_sort_progress", {"stage": "layout"}) in sent, sent
 
     # CSRF hardening: non-JSON content types are rejected before parsing
     # on every POST route (browser form posts carry text/plain or

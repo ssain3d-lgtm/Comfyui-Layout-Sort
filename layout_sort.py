@@ -40,6 +40,7 @@ from .llm_client import (
 )
 
 WS_EVENT = "layout_sort_apply"
+PROGRESS_EVENT = "layout_sort_progress"
 LLM_TIMEOUT_SECONDS = 120
 
 # The style dropdown expands to engine options; explicit per-option keys
@@ -189,7 +190,7 @@ def _scoped_workflow(workflow, scope_ids):
     return scoped, index_map
 
 
-def run_layout(workflow, options, llm_cfg=None):
+def run_layout(workflow, options, llm_cfg=None, progress=None):
     """Shared pipeline for the node and the HTTP route.
 
     With a non-empty llm_cfg["prompt"], the LLM first translates the
@@ -201,7 +202,22 @@ def run_layout(workflow, options, llm_cfg=None):
     options["scope_ids"] (node id list) restricts the sort to a
     selection: only those nodes move, anchored where the selection sits,
     and everything else — including partially selected group frames — is
-    left exactly as it was."""
+    left exactly as it was.
+
+    `progress`, when given, is called with a stage string as the run
+    advances — "llm_request" (about to ask the model, the long part),
+    "llm_done" (reply received or failed), "layout" (deterministic
+    geometry) — so a UI can show what the wait is spent on. Progress
+    callbacks may never break the sort."""
+
+    def notify(stage):
+        if progress is None:
+            return
+        try:
+            progress(stage)
+        except Exception:
+            pass
+
     if not workflow.get("nodes") and any(
         isinstance(v, dict) and "class_type" in v
         for v in workflow.values() if isinstance(v, dict)
@@ -231,6 +247,7 @@ def run_layout(workflow, options, llm_cfg=None):
         else:
             stored = load_stored_key_info()
             api_key, key_origin = stored["api_key"], stored["allowed_origin"]
+        notify("llm_request")
         plan, error = plan_layout(
             workflow, prompt,
             current_options=options,
@@ -242,6 +259,7 @@ def run_layout(workflow, options, llm_cfg=None):
             key_origin=key_origin,
             max_tokens=llm_cfg.get("max_tokens"),
         )
+        notify("llm_done")
         if error:
             llm_info = {"used": False, "error": error}
         else:
@@ -261,6 +279,7 @@ def run_layout(workflow, options, llm_cfg=None):
     if style:
         options = {**style,
                    **{k: v for k, v in options.items() if v is not None}}
+    notify("layout")
     result = compute_layout(workflow, options, extra_clusters)
     if group_index_map is not None:
         # Scoped copies renumber groups from 0; translate frame updates
@@ -317,10 +336,21 @@ else:
         workflow = data.get("workflow") or {}
         options = data.get("options") or {}
         llm_cfg = data.get("llm") or {}
+
+        def send_progress(stage):
+            # Broadcast; tabs without a sort in flight ignore the event.
+            # send_sync is thread-safe (it is how executing nodes push).
+            try:
+                PromptServer.instance.send_sync(PROGRESS_EVENT,
+                                                {"stage": stage})
+            except Exception:
+                pass
+
         try:
             # The LLM call can take a while; keep the event loop free.
             result = await asyncio.get_running_loop().run_in_executor(
-                None, run_layout, workflow, options, llm_cfg
+                None, functools.partial(run_layout, workflow, options,
+                                        llm_cfg, progress=send_progress)
             )
         except Exception as exc:  # never take the server down over a sort
             return web.json_response({"error": str(exc)}, status=500)
