@@ -1,10 +1,13 @@
-"""Optional LLM cluster suggestions via LM Studio (or any OpenAI-compatible
-server such as Ollama). Used to propose semantic, per-function clusters for
-nodes that are not inside any group; the layout engine then treats those
-clusters like groups and the frontend creates named frames for them.
+"""Optional prompt-driven sorting via LM Studio, Ollama, OpenAI or the
+Anthropic API. The user types a natural-language request on the node
+("vertical, keep my groups, tighter spacing, group the VAE nodes...");
+the model reads a digest of the real workflow and translates the request
+into a strict JSON plan made of the engine's own controls — direction,
+spacings, group mode, style, and named clusters for ungrouped nodes.
 
-Standard library only — no extra dependencies. The sort always works
-without an LLM; every failure here degrades to a plain sort.
+The model never places nodes: geometry stays 100% deterministic in
+layout_core. Standard library only — no extra dependencies. The sort
+always works without an LLM; every failure here degrades to a plain sort.
 """
 
 import json
@@ -42,27 +45,77 @@ DEFAULT_COMPLETION_TOKENS = 4096
 MAX_COMPLETION_TOKENS_CAP = 262144
 ANTHROPIC_VERSION = "2023-06-01"
 
+# The whitelist of controls a plan may set; everything else is dropped.
+PLAN_ENUMS = {
+    "direction": ("left_to_right", "top_to_bottom"),
+    "group_mode": ("cluster", "inner", "refit"),
+    "style": ("flow", "grid"),
+}
+PLAN_SPACING_KEYS = ("h_spacing", "v_spacing")
+SPACING_MIN, SPACING_MAX = 10, 600
+MAX_NOTE_LENGTH = 200
+MAX_UNSUPPORTED = 8
+
 SYSTEM_PROMPT = (
-    "You are an expert at reading ComfyUI node workflows.\n"
-    "Group the nodes into functional clusters such as: model loading, "
-    "prompting/conditioning, latent preparation, sampling, decoding, "
-    "upscaling, post-processing, saving/output, video, masking, controlnet.\n"
+    "You translate a user's natural-language layout request for a ComfyUI "
+    "node workflow into a strict JSON plan for a deterministic sorting "
+    "engine. You never place nodes yourself and never invent controls.\n"
+    "Controls you may set inside \"options\" (omit any you don't need):\n"
+    '- "direction": "left_to_right" or "top_to_bottom" (main flow axis)\n'
+    '- "h_spacing": integer 10-600, gap between layers in px\n'
+    '- "v_spacing": integer 10-600, gap between nodes in a layer in px\n'
+    '- "group_mode": "cluster" (lay out each group frame as a block, then '
+    'arrange the blocks), "inner" (keep every group frame where the user '
+    'put it and only tidy the nodes inside), "refit" (ignore frames while '
+    "sorting, re-wrap them afterwards; only for lightly grouped graphs)\n"
+    '- "style": "flow" (centered columns) or "grid" (top-aligned columns)\n'
+    "Additionally, \"clusters\" may group UNGROUPED nodes into named "
+    'frames: [{"name": "Model loading", "node_ids": [1, 2]}]. Use only '
+    "ids from the UNGROUPED list; each node in at most one cluster; only "
+    "clusters with 2+ nodes; short names (2-4 words); at most 12.\n"
     "Rules:\n"
-    "- Use only the node ids listed; never invent ids.\n"
-    "- Each node belongs to at most one cluster; leave a node out if unsure.\n"
-    "- Only include clusters with 2 or more nodes. At most 12 clusters.\n"
-    "- Give each cluster a short descriptive name (2-4 words).\n"
+    "- Map intent to controls: \"vertical / top to bottom\" -> direction; "
+    "\"keep my groups where they are / only tidy insides\" -> group_mode "
+    "\"inner\"; \"tighter/compact\" -> lower spacings, \"wider/airier\" -> "
+    "higher; \"group X-related nodes\" -> clusters.\n"
+    "- CURRENT SETTINGS in the digest are the baseline; set only what the "
+    "user asked to change.\n"
+    "- Anything the engine cannot do (exact pixel positions, resizing "
+    "nodes, recoloring, rewiring) goes into \"unsupported\" as a short "
+    "phrase — never fake it with other controls.\n"
+    '- "note": one short sentence, in the user\'s language, saying what '
+    "you set.\n"
     "Answer with JSON only, exactly in this shape:\n"
-    '{"clusters": [{"name": "Model loading", "node_ids": [1, 2]}]}'
+    '{"options": {"direction": "top_to_bottom"}, "clusters": [], '
+    '"note": "...", "unsupported": []}'
 )
 
 RESPONSE_SCHEMA = {
     "type": "json_schema",
     "json_schema": {
-        "name": "workflow_clusters",
+        "name": "layout_plan",
         "schema": {
             "type": "object",
             "properties": {
+                "options": {
+                    "type": "object",
+                    "properties": {
+                        "direction": {
+                            "type": "string",
+                            "enum": list(PLAN_ENUMS["direction"]),
+                        },
+                        "h_spacing": {"type": "integer"},
+                        "v_spacing": {"type": "integer"},
+                        "group_mode": {
+                            "type": "string",
+                            "enum": list(PLAN_ENUMS["group_mode"]),
+                        },
+                        "style": {
+                            "type": "string",
+                            "enum": list(PLAN_ENUMS["style"]),
+                        },
+                    },
+                },
                 "clusters": {
                     "type": "array",
                     "items": {
@@ -75,16 +128,53 @@ RESPONSE_SCHEMA = {
                         },
                         "required": ["name", "node_ids"],
                     },
-                }
+                },
+                "note": {"type": "string"},
+                "unsupported": {"type": "array", "items": {"type": "string"}},
             },
-            "required": ["clusters"],
+            "required": ["note"],
         },
     },
 }
 
 
-def build_digest(workflow):
-    """Compact plain-text description of the graph for the model."""
+def _group_rects(workflow):
+    """[(title, (x, y, w, h))] for every parseable group frame."""
+    rects = []
+    for raw in workflow.get("groups") or []:
+        if not isinstance(raw, dict):
+            continue
+        bounding = raw.get("bounding")
+        if isinstance(bounding, dict):  # some exports serialize as {0:...}
+            bounding = [bounding.get(k) for k in ("0", "1", "2", "3")]
+        if not isinstance(bounding, (list, tuple)) or len(bounding) < 4:
+            continue
+        try:
+            rect = tuple(float(v) for v in bounding[:4])
+        except (TypeError, ValueError):
+            continue
+        rects.append((str(raw.get("title") or "Group"), rect))
+    return rects
+
+
+def _node_center(raw):
+    pos, size = raw.get("pos"), raw.get("size")
+    if isinstance(pos, dict):
+        pos = [pos.get("0"), pos.get("1")]
+    if isinstance(size, dict):
+        size = [size.get("0"), size.get("1")]
+    try:
+        x, y = float(pos[0]), float(pos[1])
+        w, h = float(size[0]), float(size[1])
+    except (TypeError, ValueError, IndexError):
+        return None
+    return (x + w / 2.0, y + h / 2.0)
+
+
+def build_digest(workflow, current_options=None):
+    """Compact plain-text description of the graph for the model: nodes,
+    links, existing group frames, which nodes are still ungrouped, and the
+    node's current widget settings as the baseline."""
     # Subgraph instance nodes carry an opaque UUID as their type; resolve
     # it to the subgraph's name so the model gets a semantic signal.
     subgraph_names = {}
@@ -93,8 +183,20 @@ def build_digest(workflow):
         if isinstance(sub, dict) and sub.get("id") is not None:
             subgraph_names[str(sub["id"])] = str(sub.get("name") or "Subgraph")
 
+    group_rects = _group_rects(workflow)
+
+    def grouped(raw):
+        center = _node_center(raw)
+        if center is None:
+            return False
+        return any(
+            r[0] <= center[0] <= r[0] + r[2] and r[1] <= center[1] <= r[1] + r[3]
+            for _t, r in group_rects
+        )
+
     lines = ["NODES (id | type | title):"]
     nodes = workflow.get("nodes") or []
+    ungrouped = []
     for raw in nodes[:MAX_NODES]:
         if not isinstance(raw, dict) or "id" not in raw:
             continue
@@ -104,8 +206,16 @@ def build_digest(workflow):
         title = str(raw.get("title") or "")
         suffix = f" | {title}" if title and title != node_type else ""
         lines.append(f"{raw['id']} | {node_type}{suffix}")
+        if not grouped(raw):
+            ungrouped.append(str(raw["id"]))
     if len(nodes) > MAX_NODES:
         lines.append(f"... {len(nodes) - MAX_NODES} more nodes omitted")
+
+    if group_rects:
+        lines.append("EXISTING GROUP FRAMES (title):")
+        lines.extend(f"- {title}" for title, _r in group_rects)
+    lines.append("UNGROUPED NODE IDS (the only ids usable in clusters): "
+                 + (", ".join(ungrouped) if ungrouped else "(none)"))
 
     lines.append("LINKS (origin_id -> target_id):")
     links = workflow.get("links") or []
@@ -122,6 +232,16 @@ def build_digest(workflow):
             continue
         lines.append(f"{origin} -> {target}")
         count += 1
+
+    if current_options:
+        shown = []
+        for key in ("direction", "h_spacing", "v_spacing", "group_mode",
+                    "style"):
+            value = current_options.get(key)
+            if value is not None:
+                shown.append(f"{key}={value}")
+        if shown:
+            lines.append("CURRENT SETTINGS: " + ", ".join(shown))
     return "\n".join(lines)
 
 
@@ -362,15 +482,13 @@ def _parse_first_json(text):
     raise ValueError("reply contains unbalanced JSON")
 
 
-def _validate(parsed, workflow):
+def _validate_clusters(items, workflow):
+    if not isinstance(items, list):
+        return []
     valid_ids = {}
     for raw in workflow.get("nodes") or []:
         if isinstance(raw, dict) and "id" in raw:
             valid_ids[str(raw["id"])] = raw["id"]
-
-    items = parsed.get("clusters") if isinstance(parsed, dict) else parsed
-    if not isinstance(items, list):
-        raise ValueError("no clusters array in reply")
 
     clusters = []
     taken = set()
@@ -395,8 +513,46 @@ def _validate(parsed, workflow):
     return clusters
 
 
+def _validate_plan(parsed, workflow):
+    """Reduce a model reply to a safe plan the engine can execute.
+
+    Options go through a strict whitelist (unknown keys and out-of-enum
+    values are dropped, spacings clamped) so a confused model can never
+    inject engine options like detach_types or snap distortions.
+    Returns {"options", "clusters", "note", "unsupported"} — always all
+    four keys, empty when absent.
+    """
+    if not isinstance(parsed, dict):
+        raise ValueError("reply is not a JSON plan object")
+    raw_options = parsed.get("options")
+    options = {}
+    if isinstance(raw_options, dict):
+        for key, allowed in PLAN_ENUMS.items():
+            value = str(raw_options.get(key) or "").strip().lower()
+            if value in allowed:
+                options[key] = value
+        for key in PLAN_SPACING_KEYS:
+            value = raw_options.get(key)
+            try:
+                number = int(value)
+            except (TypeError, ValueError):
+                continue
+            options[key] = max(SPACING_MIN, min(SPACING_MAX, number))
+    clusters = _validate_clusters(parsed.get("clusters"), workflow)
+    note = str(parsed.get("note") or "").strip()[:MAX_NOTE_LENGTH]
+    unsupported = [
+        str(item).strip()[:120]
+        for item in (parsed.get("unsupported") or [])[:MAX_UNSUPPORTED]
+        if str(item).strip()
+    ]
+    if not options and not clusters and not note and not unsupported:
+        raise ValueError("the model returned no actionable plan")
+    return {"options": options, "clusters": clusters,
+            "note": note, "unsupported": unsupported}
+
+
 def _parse_anthropic_reply(data):
-    """Extract clusters from an Anthropic Messages API response."""
+    """Extract the reply JSON from an Anthropic Messages API response."""
     stop_reason = data.get("stop_reason")
     if stop_reason == "refusal":
         raise ValueError("the model declined this request")
@@ -419,7 +575,8 @@ def _parse_anthropic_reply(data):
 
 
 def _parse_reply(data):
-    """Extract clusters from a chat completion, with actionable errors."""
+    """Extract the reply JSON from a chat completion, with actionable
+    errors."""
     choice = (data.get("choices") or [{}])[0]
     message = choice.get("message") or {}
     content = message.get("content") or ""
@@ -445,10 +602,15 @@ def _parse_reply(data):
     raise ValueError("reply contains no JSON")
 
 
-def suggest_clusters(workflow, base_url=None, model="", timeout=60,
-                     api_key="", key_origin="*", max_tokens=None,
-                     provider=None):
-    """Ask the local LLM for semantic clusters.
+def plan_layout(workflow, prompt, current_options=None, base_url=None,
+                model="", timeout=60, api_key="", key_origin="*",
+                max_tokens=None, provider=None):
+    """Translate the user's natural-language request into a layout plan.
+
+    Returns (plan, None) on success — plan is the validated
+    {"options", "clusters", "note", "unsupported"} dict from
+    `_validate_plan` — or (None, error_message) on any failure; callers
+    fall back to a plain sort with the widget settings.
 
     `api_key` is sent as a Bearer token, but only when `key_allowed_for`
     permits it for this base_url (`key_origin`: "*" = caller explicitly
@@ -458,9 +620,6 @@ def suggest_clusters(workflow, base_url=None, model="", timeout=60,
     gate (its origin comes from LAYOUT_SORT_LLM_ALLOWED_ORIGIN). This
     stops a shared workflow from pointing llm_base_url at a hostile host
     and exfiltrating the server-stored key.
-
-    Returns (clusters, None) on success or ([], error_message) on any
-    failure — callers fall back to a plain sort.
     """
     base = _ensure_scheme((base_url or DEFAULT_BASE_URL).strip().rstrip("/")
                           or DEFAULT_BASE_URL)
@@ -483,31 +642,32 @@ def suggest_clusters(workflow, base_url=None, model="", timeout=60,
     if api_key and not is_valid_api_key(api_key):
         # Refuse before any header is built, so the key value can never
         # surface in an exception message, log line, or toast.
-        return [], "the API key contains invalid characters"
+        return None, "the API key contains invalid characters"
     model = (model or "").strip()
     if model.lower() == "auto":
         model = ""
     budget = int(_clamped_tokens(max_tokens))
     provider = provider or _provider_for(base)
+    request_text = (build_digest(workflow, current_options)
+                    + "\n\nUSER REQUEST:\n" + str(prompt or "").strip())
     try:
         model_id = model or _pick_model(base, min(timeout, 15), api_key, provider)
-        digest = build_digest(workflow)
         if provider == "anthropic":
             payload = {
                 "model": model_id,
                 "max_tokens": budget,
                 "system": SYSTEM_PROMPT,
-                "messages": [{"role": "user", "content": digest}],
+                "messages": [{"role": "user", "content": request_text}],
             }
             url = (format_origin(base) or base) + "/v1/messages"
             data = _request_json(url, payload, timeout, api_key, provider)
-            clusters = _validate(_parse_anthropic_reply(data), workflow)
+            plan = _validate_plan(_parse_anthropic_reply(data), workflow)
         else:
             payload = {
                 "model": model_id,
                 "messages": [
                     {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": digest},
+                    {"role": "user", "content": request_text},
                 ],
                 "temperature": 0.2,
                 "max_tokens": budget,
@@ -527,11 +687,12 @@ def suggest_clusters(workflow, base_url=None, model="", timeout=60,
                 payload.pop("response_format", None)
                 data = _request_json(base + "/chat/completions", payload,
                                      timeout, api_key)
-            clusters = _validate(_parse_reply(data), workflow)
-        if not clusters:
-            return [], "the model returned no usable clusters"
-        LOGGER.info("LLM suggested %d clusters via %s", len(clusters), model_id)
-        return clusters, None
+            plan = _validate_plan(_parse_reply(data), workflow)
+        LOGGER.info(
+            "LLM plan via %s: options=%s clusters=%d unsupported=%d",
+            model_id, plan["options"], len(plan["clusters"]),
+            len(plan["unsupported"]))
+        return plan, None
     except Exception as exc:  # degrade to a plain sort, never break it
         message = f"{type(exc).__name__}: {exc} (endpoint: {base})"
         if withheld and isinstance(exc, urllib.error.HTTPError) \
@@ -539,5 +700,5 @@ def suggest_clusters(workflow, base_url=None, model="", timeout=60,
             message += (" — the stored API key was withheld because this "
                         "llm_base_url is outside its allowed origin; re-save "
                         "the key while the node points at this server")
-        LOGGER.warning("LLM clustering unavailable (%s)", message)
-        return [], message
+        LOGGER.warning("LLM plan unavailable (%s)", message)
+        return None, message

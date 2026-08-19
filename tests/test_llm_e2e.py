@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""End-to-end tests for the Comfyui-Layout-Sort LLM clustering path.
+"""End-to-end tests for the Comfyui-Layout-Sort prompt-driven LLM path.
 
 Starts a mock OpenAI-compatible server (http.server on 127.0.0.1, port 0)
-and drives llm_client.suggest_clusters and layout_sort.run_layout through
-happy paths, validation edge cases, error handling, the structured-output
-fallback, and the "real user groups always win" rule.
+and drives llm_client.plan_layout and layout_sort.run_layout through
+happy paths, plan validation (option whitelist + cluster cleaning), error
+handling, the structured-output fallback, key security, and the "empty
+prompt never contacts an LLM" rule.
 
 Read-only with respect to the package repo; run with python3.
 """
@@ -215,16 +216,25 @@ def center_inside(rect, bounding):
     return bx <= cx <= bx + bw and by <= cy <= by + bh
 
 
+PROMPT = "세로로 정렬하고 로더끼리 묶어줘"
+
+PLAN_HAPPY = {
+    "options": {"direction": "top_to_bottom", "v_spacing": 30},
+    "clusters": [{"name": "Loaders", "node_ids": [4, 10]},
+                 {"name": "Sampling", "node_ids": [3, 5]}],
+    "note": "세로 방향, 간격 30, 클러스터 2개",
+    "unsupported": [],
+}
+
 CONTENT_HAPPY = (
-    "<think>reasoning... 4 and 10 load models, 3 samples from latent 5, "
-    "so I will group by function.</think>\n"
-    "Sure! Here are the clusters:\n"
-    "```json\n"
-    '{"clusters": [{"name": "Loaders", "node_ids": [4, 10]}, '
-    '{"name": "Sampling", "node_ids": [3, 5]}]}\n'
-    "```\n"
+    "<think>the user wants vertical flow and loader clusters; 4 and 10 "
+    "load models, 3 samples from latent 5.</think>\n"
+    "Sure! Here is the plan:\n"
+    "```json\n" + json.dumps(PLAN_HAPPY, ensure_ascii=False) + "\n```\n"
     "Let me know if you need anything else."
 )
+
+VALID_OPTIONS = {"direction": "top_to_bottom", "v_spacing": 30}
 
 
 # ---------------------------------------------------------------------------
@@ -241,16 +251,21 @@ def case(name):
     return wrap
 
 
-@case("1. happy path: think-block + fenced JSON, auto-picked model")
+@case("1. happy path: think-block + fenced plan JSON, auto-picked model")
 def case_happy_path():
     SERVER.chat_content = CONTENT_HAPPY
-    clusters, err = llm_client.suggest_clusters(
-        make_workflow(), base_url=BASE, model="", timeout=30)
+    plan, err = llm_client.plan_layout(
+        make_workflow(), PROMPT,
+        current_options={"direction": "left_to_right", "h_spacing": 80},
+        base_url=BASE, model="", timeout=30)
     assert err is None, f"expected no error, got: {err!r}"
-    assert clusters == [
+    assert plan["options"] == VALID_OPTIONS, plan
+    assert plan["clusters"] == [
         {"name": "Loaders", "node_ids": [4, 10]},
         {"name": "Sampling", "node_ids": [3, 5]},
-    ], f"unexpected clusters: {clusters!r}"
+    ], f"unexpected clusters: {plan['clusters']!r}"
+    assert plan["note"] == PLAN_HAPPY["note"], plan
+    assert plan["unsupported"] == [], plan
 
     reqs = SERVER.snapshot()
     gets = [r for r in reqs if r["method"] == "GET"]
@@ -264,39 +279,58 @@ def case_happy_path():
         f"auto-picked model not sent in POST body: {body.get('model')!r}"
     assert "response_format" in body, "first attempt should send response_format"
     assert body["messages"][0]["role"] == "system"
-    assert "NODES" in body["messages"][1]["content"], "digest missing from user msg"
+    user_msg = body["messages"][1]["content"]
+    for expected in ("NODES", "UNGROUPED NODE IDS", "LINKS",
+                     "CURRENT SETTINGS: direction=left_to_right",
+                     "USER REQUEST:\n" + PROMPT):
+        assert expected in user_msg, f"digest missing {expected!r}"
 
 
-@case("2. validation: unknown id, singleton, duplicate (first wins), string id")
+@case("2. plan validation: option whitelist/clamp + cluster cleaning")
 def case_validation():
     long_name = "L" * 75
-    SERVER.chat_content = json.dumps({"clusters": [
-        {"name": long_name, "node_ids": [4, 999, 10]},   # 999 unknown
-        {"name": "Decode", "node_ids": [4, 8, 9]},        # 4 already taken
-        {"name": "", "node_ids": ["3", 5]},               # "3" matches int 3
-        {"name": "Solo", "node_ids": [6]},                # singleton -> dropped
-    ]})
-    clusters, err = llm_client.suggest_clusters(
-        make_workflow(), base_url=BASE, model="", timeout=30)
+    SERVER.chat_content = json.dumps({
+        "options": {
+            "direction": "diagonal",        # not in enum -> dropped
+            "group_mode": "banana",         # not in enum -> dropped
+            "style": "GRID",                # case-insensitive -> "grid"
+            "h_spacing": "9000",            # clamps to 600
+            "v_spacing": 3,                 # clamps to 10
+            "detach_types": ["KSampler"],   # not whitelisted -> dropped
+            "snap_grid": 0,                 # not whitelisted -> dropped
+        },
+        "clusters": [
+            {"name": long_name, "node_ids": [4, 999, 10]},   # 999 unknown
+            {"name": "Decode", "node_ids": [4, 8, 9]},        # 4 already taken
+            {"name": "", "node_ids": ["3", 5]},               # "3" matches int 3
+            {"name": "Solo", "node_ids": [6]},                # singleton -> drop
+        ],
+        "note": "n" * 500,                                    # truncated to 200
+    })
+    plan, err = llm_client.plan_layout(
+        make_workflow(), PROMPT, base_url=BASE, model="", timeout=30)
     assert err is None, f"expected no error, got: {err!r}"
-    assert clusters == [
+    assert plan["options"] == {"style": "grid", "h_spacing": 600,
+                               "v_spacing": 10}, plan["options"]
+    assert plan["clusters"] == [
         {"name": "L" * 60, "node_ids": [4, 10]},          # truncated to 60
         {"name": "Decode", "node_ids": [8, 9]},           # 4 kept by cluster 1
         {"name": "Cluster 3", "node_ids": [3, 5]},        # name fallback
-    ], f"unexpected cleaned clusters: {clusters!r}"
+    ], f"unexpected cleaned clusters: {plan['clusters']!r}"
+    assert len(plan["note"]) == 200, len(plan["note"])
 
 
-@case("3. garbage content (no JSON) -> ([], error)")
+@case("3. garbage content (no JSON) -> (None, error)")
 def case_garbage():
-    SERVER.chat_content = "I could not figure out any grouping, sorry!"
-    clusters, err = llm_client.suggest_clusters(
-        make_workflow(), base_url=BASE, model="", timeout=30)
-    assert clusters == [], f"expected no clusters, got: {clusters!r}"
+    SERVER.chat_content = "I could not figure out any plan, sorry!"
+    plan, err = llm_client.plan_layout(
+        make_workflow(), PROMPT, base_url=BASE, model="", timeout=30)
+    assert plan is None, f"expected no plan, got: {plan!r}"
     assert isinstance(err, str) and err.strip(), \
         f"expected non-empty error message, got: {err!r}"
 
 
-@case("4. dead server -> ([], error) and returns quickly")
+@case("4. dead server -> (None, error) and returns quickly")
 def case_dead_server():
     # Grab a port that is definitely closed right now.
     probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -305,11 +339,11 @@ def case_dead_server():
     probe.close()
 
     start = time.monotonic()
-    clusters, err = llm_client.suggest_clusters(
-        make_workflow(), base_url=f"http://127.0.0.1:{dead_port}/v1",
-        model="", timeout=8)
+    plan, err = llm_client.plan_layout(
+        make_workflow(), PROMPT,
+        base_url=f"http://127.0.0.1:{dead_port}/v1", model="", timeout=8)
     elapsed = time.monotonic() - start
-    assert clusters == [], f"expected no clusters, got: {clusters!r}"
+    assert plan is None, f"expected no plan, got: {plan!r}"
     assert isinstance(err, str) and err.strip(), \
         f"expected non-empty error, got: {err!r}"
     assert elapsed < 10.0, f"dead-server failure took {elapsed:.1f}s (>= 10s)"
@@ -319,11 +353,11 @@ def case_dead_server():
 def case_response_format_fallback():
     SERVER.chat_content = CONTENT_HAPPY
     SERVER.fail_on_response_format = True
-    clusters, err = llm_client.suggest_clusters(
-        make_workflow(), base_url=BASE, model="", timeout=30)
+    plan, err = llm_client.plan_layout(
+        make_workflow(), PROMPT, base_url=BASE, model="", timeout=30)
     assert err is None, f"expected success via retry, got error: {err!r}"
-    assert [c["name"] for c in clusters] == ["Loaders", "Sampling"], \
-        f"unexpected clusters after retry: {clusters!r}"
+    assert [c["name"] for c in plan["clusters"]] == ["Loaders", "Sampling"], \
+        f"unexpected clusters after retry: {plan['clusters']!r}"
 
     posts = [r for r in SERVER.snapshot()
              if r["method"] == "POST" and r["path"] == "/v1/chat/completions"]
@@ -333,23 +367,36 @@ def case_response_format_fallback():
         "retry still contained response_format"
 
 
-@case("6. run_layout, no real groups -> 2 named new_groups containing members")
+@case("6. run_layout: plan options override widgets, clusters become frames")
 def case_run_layout_new_groups():
     SERVER.chat_content = CONTENT_HAPPY
     wf = make_workflow()
+    # Widgets say horizontal; the prompt's plan says vertical and must win.
     res = layout_sort.run_layout(
-        wf, {}, {"enabled": True, "base_url": BASE, "model": ""})
+        wf, {"direction": "left_to_right"},
+        {"prompt": PROMPT, "base_url": BASE, "model": ""})
 
-    assert res["llm"]["used"] is True, f"llm info: {res.get('llm')!r}"
+    llm = res["llm"]
+    assert llm["used"] is True, f"llm info: {llm!r}"
+    assert llm["applied"] == VALID_OPTIONS, llm
+    assert llm["note"] == PLAN_HAPPY["note"], llm
+    assert llm["clusters"] == 2 and llm["names"] == ["Loaders", "Sampling"], llm
     assert res["groups"] == [], f"expected no real-group updates: {res['groups']!r}"
     assert set(res["positions"].keys()) == {str(n["id"]) for n in wf["nodes"]}, \
         f"positions keys wrong: {sorted(res['positions'])!r}"
+
+    # direction=top_to_bottom applied: every link flows downward.
+    nodes = node_map(wf)
+    pos = {int(k): v for k, v in res["positions"].items()}
+    for _lid, origin, _os, target, _ts, _ty in wf["links"]:
+        o_bottom = pos[origin][1] + nodes[origin]["size"][1]
+        assert o_bottom <= pos[target][1] - TITLE_HEIGHT + 1e-6, \
+            f"link {origin}->{target} does not flow top to bottom"
 
     ng = res["new_groups"]
     assert [g["title"] for g in ng] == ["Loaders", "Sampling"], \
         f"unexpected new_groups: {ng!r}"
     by_title = {g["title"]: g["bounding"] for g in ng}
-    nodes = node_map(wf)
     for title, members in (("Loaders", [4, 10]), ("Sampling", [3, 5])):
         bounding = by_title[title]
         for nid in members:
@@ -367,10 +414,10 @@ def case_run_layout_new_groups():
 
 @case("7. user groups win: real group keeps its nodes, cluster shrinks/drops")
 def case_user_groups_win():
-    SERVER.chat_content = CONTENT_HAPPY  # LLM claims [4,10] and [3,5]
+    SERVER.chat_content = CONTENT_HAPPY  # plan claims [4,10] and [3,5]
     wf = make_workflow(with_group=True)  # real group already holds 4 and 10
     res = layout_sort.run_layout(
-        wf, {}, {"enabled": True, "base_url": BASE, "model": ""})
+        wf, {}, {"prompt": PROMPT, "base_url": BASE, "model": ""})
 
     assert res["llm"]["used"] is True, f"llm info: {res.get('llm')!r}"
 
@@ -384,6 +431,8 @@ def case_user_groups_win():
     ng = res["new_groups"]
     assert [g["title"] for g in ng] == ["Sampling"], (
         f"expected only the Sampling cluster to survive, got: {ng!r}")
+    assert res["llm"]["clusters"] == 1 and res["llm"]["names"] == ["Sampling"], \
+        res["llm"]
     sampling_bounding = ng[0]["bounding"]
 
     nodes = node_map(wf)
@@ -403,41 +452,41 @@ def case_user_groups_win():
             f"cluster node {nid} leaked into the real group frame")
 
 
-@case("8. run_layout llm enabled + group_mode=refit -> llm skipped, layout ok")
-def case_refit_skips_llm():
-    SERVER.chat_content = CONTENT_HAPPY
+@case("8. plan clusters + non-cluster group_mode -> honest unsupported note")
+def case_clusters_need_cluster_mode():
+    SERVER.chat_content = json.dumps({
+        "options": {},
+        "clusters": [{"name": "Loaders", "node_ids": [4, 10]}],
+        "note": "clustered the loaders",
+    })
     wf = make_workflow()
-    before = len(SERVER.snapshot())
     res = layout_sort.run_layout(
         wf, {"group_mode": "refit"},
-        {"enabled": True, "base_url": BASE, "model": ""})
-    after = len(SERVER.snapshot())
-
-    assert after == before, "LLM server was contacted despite group_mode=refit"
-    info = res.get("llm")
-    assert isinstance(info, dict) and info.get("used") is False, \
-        f"expected llm used=False, got: {info!r}"
-    assert isinstance(info.get("error"), str) and "group_mode" in info["error"], \
-        f"expected explanatory group_mode error, got: {info.get('error')!r}"
+        {"prompt": PROMPT, "base_url": BASE, "model": ""})
+    llm = res.get("llm") or {}
+    assert llm.get("used") is True, llm
+    assert any("cluster" in u for u in llm.get("unsupported") or []), \
+        f"expected a clusters-need-cluster-mode notice: {llm!r}"
+    assert res["new_groups"] == [], \
+        f"refit must not invent groups: {res['new_groups']!r}"
     assert set(res["positions"].keys()) == {str(n["id"]) for n in wf["nodes"]}, \
         "refit layout missing positions"
-    assert res["new_groups"] == [], f"refit must not invent groups: {res['new_groups']!r}"
 
 
-@case("9. dropped singleton cluster must NOT consume its node id (fixed)")
+@case("9. dropped singleton cluster must NOT consume its node id")
 def case_probe_singleton_consumes():
-    # Regression test for the _validate fix: ids are claimed only by
-    # clusters that survive the len>=2 check, so a node listed in a
-    # discarded singleton X stays available to a later valid cluster Y.
+    # Ids are claimed only by clusters that survive the len>=2 check, so a
+    # node listed in a discarded singleton X stays available to a later
+    # valid cluster Y.
     SERVER.chat_content = json.dumps({"clusters": [
         {"name": "X", "node_ids": [6]},
         {"name": "Y", "node_ids": [6, 7]},
-    ]})
-    clusters, err = llm_client.suggest_clusters(
-        make_workflow(), base_url=BASE, model="", timeout=30)
+    ], "note": "x"})
+    plan, err = llm_client.plan_layout(
+        make_workflow(), PROMPT, base_url=BASE, model="", timeout=30)
     assert err is None, f"unexpected error: {err!r}"
-    assert clusters == [{"name": "Y", "node_ids": [6, 7]}], \
-        f"Y should survive with both members: {clusters!r}"
+    assert plan["clusters"] == [{"name": "Y", "node_ids": [6, 7]}], \
+        f"Y should survive with both members: {plan['clusters']!r}"
 
 
 @case("10. api_key becomes a Bearer header; env var fallback; none by default")
@@ -446,8 +495,8 @@ def case_api_key():
 
     # Explicit key: every request (model pick + chat) carries the header.
     SERVER.chat_content = CONTENT_HAPPY
-    clusters, err = llm_client.suggest_clusters(
-        make_workflow(), base_url=BASE, model="", timeout=30,
+    _plan, err = llm_client.plan_layout(
+        make_workflow(), PROMPT, base_url=BASE, model="", timeout=30,
         api_key="sk-test-123")
     assert err is None, f"unexpected error: {err!r}"
     auths = [r["auth"] for r in SERVER.snapshot()]
@@ -456,8 +505,8 @@ def case_api_key():
     # No key: no Authorization header at all (LM Studio default setup).
     SERVER.reset()
     SERVER.chat_content = CONTENT_HAPPY
-    clusters, err = llm_client.suggest_clusters(
-        make_workflow(), base_url=BASE, model="", timeout=30)
+    _plan, err = llm_client.plan_layout(
+        make_workflow(), PROMPT, base_url=BASE, model="", timeout=30)
     assert err is None, f"unexpected error: {err!r}"
     auths = [r["auth"] for r in SERVER.snapshot()]
     assert auths and all(a is None for a in auths), auths
@@ -467,8 +516,8 @@ def case_api_key():
     SERVER.chat_content = CONTENT_HAPPY
     os.environ[llm_client.API_KEY_ENV_VAR] = "sk-from-env"
     try:
-        clusters, err = llm_client.suggest_clusters(
-            make_workflow(), base_url=BASE, model="", timeout=30)
+        _plan, err = llm_client.plan_layout(
+            make_workflow(), PROMPT, base_url=BASE, model="", timeout=30)
     finally:
         del os.environ[llm_client.API_KEY_ENV_VAR]
     assert err is None, f"unexpected error: {err!r}"
@@ -495,7 +544,7 @@ def case_key_store():
         SERVER.chat_content = CONTENT_HAPPY
         res = layout_sort.run_layout(
             make_workflow(), {"group_mode": "cluster"},
-            {"enabled": True, "base_url": BASE, "model": ""})
+            {"prompt": PROMPT, "base_url": BASE, "model": ""})
         assert res["llm"]["used"] is True, res["llm"]
         auths = [r["auth"] for r in SERVER.snapshot()]
         assert auths and all(a == "Bearer sk-stored" for a in auths), auths
@@ -505,7 +554,7 @@ def case_key_store():
         SERVER.chat_content = CONTENT_HAPPY
         layout_sort.run_layout(
             make_workflow(), {"group_mode": "cluster"},
-            {"enabled": True, "base_url": BASE, "model": "",
+            {"prompt": PROMPT, "base_url": BASE, "model": "",
              "api_key": "sk-explicit"})
         auths = [r["auth"] for r in SERVER.snapshot()]
         assert auths and all(a == "Bearer sk-explicit" for a in auths), auths
@@ -538,9 +587,10 @@ def case_invalid_key_chars():
     SERVER.reset()
     SERVER.chat_content = CONTENT_HAPPY
     secret = "sk-ZZSECRETZZ\nX: injected"
-    clusters, err = llm_client.suggest_clusters(
-        make_workflow(), base_url=BASE, model="", timeout=30, api_key=secret)
-    assert clusters == [] and err, (clusters, err)
+    plan, err = llm_client.plan_layout(
+        make_workflow(), PROMPT, base_url=BASE, model="", timeout=30,
+        api_key=secret)
+    assert plan is None and err, (plan, err)
     assert "ZZSECRETZZ" not in err, f"key leaked into error: {err!r}"
     assert not SERVER.snapshot(), "no request may reach the server"
 
@@ -575,8 +625,8 @@ def case_redirect_strips_auth():
         # Different port = different origin, even on the same host.
         SERVER.redirect_models_to = (
             f"http://127.0.0.1:{other.server_address[1]}/v1/models")
-        clusters, err = llm_client.suggest_clusters(
-            make_workflow(), base_url=BASE, model="", timeout=30,
+        _plan, err = llm_client.plan_layout(
+            make_workflow(), PROMPT, base_url=BASE, model="", timeout=30,
             api_key="sk-redirect-test")
         assert err is None, f"unexpected error: {err!r}"
         first_hop = [r for r in SERVER.snapshot() if r["method"] == "GET"]
@@ -606,11 +656,11 @@ def case_key_origin_binding():
     assert allowed("https://anything.example/v1", "*")
 
     # Integration: a loopback-bound (None) stored key still reaches the
-    # loopback mock server through suggest_clusters.
+    # loopback mock server through plan_layout.
     SERVER.reset()
     SERVER.chat_content = CONTENT_HAPPY
-    clusters, err = llm_client.suggest_clusters(
-        make_workflow(), base_url=BASE, model="", timeout=30,
+    _plan, err = llm_client.plan_layout(
+        make_workflow(), PROMPT, base_url=BASE, model="", timeout=30,
         api_key="sk-bound", key_origin=None)
     assert err is None, f"unexpected error: {err!r}"
     auths = [r["auth"] for r in SERVER.snapshot()]
@@ -623,17 +673,17 @@ def case_thinking_truncation():
     # Unterminated <think>: the model burned the whole budget reasoning.
     SERVER.chat_content = "<think>step 1... step 2... let me reconsider"
     SERVER.finish_reason = "length"
-    clusters, err = llm_client.suggest_clusters(
-        make_workflow(), base_url=BASE, model="", timeout=30)
-    assert clusters == [] and err, (clusters, err)
+    plan, err = llm_client.plan_layout(
+        make_workflow(), PROMPT, base_url=BASE, model="", timeout=30)
+    assert plan is None and err, (plan, err)
     assert "token limit" in err, f"error should explain the token limit: {err!r}"
 
     # An "auto" model value behaves like empty (auto-pick).
     SERVER.reset()
     SERVER.chat_content = CONTENT_HAPPY
-    clusters, err = llm_client.suggest_clusters(
-        make_workflow(), base_url=BASE, model="auto", timeout=30)
-    assert err is None and clusters, (clusters, err)
+    plan, err = llm_client.plan_layout(
+        make_workflow(), PROMPT, base_url=BASE, model="auto", timeout=30)
+    assert err is None and plan, (plan, err)
     posts = [r for r in SERVER.snapshot() if r["method"] == "POST"]
     assert posts and posts[0]["body"]["model"] == "qwen-test", posts
 
@@ -642,8 +692,8 @@ def case_thinking_truncation():
 def case_max_tokens():
     SERVER.reset()
     SERVER.chat_content = CONTENT_HAPPY
-    clusters, err = llm_client.suggest_clusters(
-        make_workflow(), base_url=BASE, model="", timeout=30,
+    _plan, err = llm_client.plan_layout(
+        make_workflow(), PROMPT, base_url=BASE, model="", timeout=30,
         max_tokens=100000)
     assert err is None, err
     posts = [r for r in SERVER.snapshot() if r["method"] == "POST"]
@@ -651,15 +701,15 @@ def case_max_tokens():
 
     SERVER.reset()
     SERVER.chat_content = CONTENT_HAPPY
-    llm_client.suggest_clusters(make_workflow(), base_url=BASE, model="",
-                                timeout=30, max_tokens=99999999)
+    llm_client.plan_layout(make_workflow(), PROMPT, base_url=BASE, model="",
+                           timeout=30, max_tokens=99999999)
     posts = [r for r in SERVER.snapshot() if r["method"] == "POST"]
     assert posts[0]["body"]["max_tokens"] == llm_client.MAX_COMPLETION_TOKENS_CAP
 
     SERVER.reset()
     SERVER.chat_content = CONTENT_HAPPY
-    llm_client.suggest_clusters(make_workflow(), base_url=BASE, model="",
-                                timeout=30, max_tokens=None)
+    llm_client.plan_layout(make_workflow(), PROMPT, base_url=BASE, model="",
+                           timeout=30, max_tokens=None)
     posts = [r for r in SERVER.snapshot() if r["method"] == "POST"]
     assert posts[0]["body"]["max_tokens"] == llm_client.DEFAULT_COMPLETION_TOKENS
 
@@ -668,15 +718,18 @@ def case_max_tokens():
 def case_anthropic_provider():
     SERVER.reset()
     SERVER.chat_content = CONTENT_HAPPY
-    clusters, err = llm_client.suggest_clusters(
-        make_workflow(), base_url=BASE, model="claude-test", timeout=30,
-        api_key="sk-ant-mock", max_tokens=8192, provider="anthropic")
-    assert err is None and len(clusters) == 2, (clusters, err)
+    plan, err = llm_client.plan_layout(
+        make_workflow(), PROMPT, base_url=BASE, model="claude-test",
+        timeout=30, api_key="sk-ant-mock", max_tokens=8192,
+        provider="anthropic")
+    assert err is None and len(plan["clusters"]) == 2, (plan, err)
     posts = [r for r in SERVER.snapshot() if r["method"] == "POST"]
     assert posts and posts[0]["path"] == "/v1/messages", posts
     body = posts[0]["body"]
     assert body["model"] == "claude-test" and body["max_tokens"] == 8192
     assert "system" in body and "response_format" not in body, body
+    assert "USER REQUEST:\n" + PROMPT in body["messages"][0]["content"], \
+        "prompt missing from the Anthropic user message"
     assert posts[0]["x_key"] == "sk-ant-mock" and posts[0]["auth"] is None, \
         "Anthropic auth must use x-api-key, not Authorization"
 
@@ -684,10 +737,10 @@ def case_anthropic_provider():
     SERVER.reset()
     SERVER.chat_content = "I was about to answer but"
     SERVER.anthropic_stop = "max_tokens"
-    clusters, err = llm_client.suggest_clusters(
-        make_workflow(), base_url=BASE, model="claude-test", timeout=30,
-        provider="anthropic")
-    assert clusters == [] and "token limit" in (err or ""), (clusters, err)
+    plan, err = llm_client.plan_layout(
+        make_workflow(), PROMPT, base_url=BASE, model="claude-test",
+        timeout=30, provider="anthropic")
+    assert plan is None and "token limit" in (err or ""), (plan, err)
 
     # Provider auto-detection by host.
     assert llm_client._provider_for("https://api.anthropic.com") == "anthropic"
@@ -695,7 +748,6 @@ def case_anthropic_provider():
     assert llm_client._provider_for("https://api.openai.com/v1") == "openai"
 
     # llm_provider dropdown resolution.
-    # (see case 18 for the grouped-workflow skip)
     resolve = llm_client.resolve_base_url
     assert resolve("lmstudio", "http://ignored") == "http://127.0.0.1:1234/v1"
     assert resolve("ollama", "") == "http://127.0.0.1:11434/v1"
@@ -706,19 +758,23 @@ def case_anthropic_provider():
     assert resolve(None, "http://my.server:8080/v1") == "http://my.server:8080/v1"
 
 
-@case("18. LLM call is skipped entirely on an already-grouped workflow")
-def case_llm_skip_grouped():
+@case("18. empty/whitespace prompt never contacts any LLM")
+def case_empty_prompt_no_llm():
     SERVER.reset()
     SERVER.chat_content = CONTENT_HAPPY
-    wf = make_workflow()
-    wf["groups"] = [{"title": "All", "bounding": [0, 0, 2200, 1200]}]
-    res = layout_sort.run_layout(
-        wf, {"group_mode": "cluster"},
-        {"enabled": True, "base_url": BASE, "model": ""})
-    llm = res.get("llm") or {}
-    assert llm.get("used") is False and llm.get("skipped"), llm
+    for silent in ("", "   \n  ", None):
+        wf = make_workflow()
+        res = layout_sort.run_layout(
+            wf, {"group_mode": "cluster"},
+            {"prompt": silent, "base_url": BASE, "model": ""})
+        assert "llm" not in res, f"llm info present for prompt {silent!r}"
+        assert set(res["positions"].keys()) == \
+            {str(n["id"]) for n in wf["nodes"]}
     assert not SERVER.snapshot(), \
-        "no HTTP request may be made when clustering is skipped"
+        "no HTTP request may be made when the prompt is empty"
+    # No llm_cfg at all behaves the same.
+    res = layout_sort.run_layout(make_workflow(), {})
+    assert "llm" not in res and not SERVER.snapshot()
 
 
 # ---------------------------------------------------------------------------

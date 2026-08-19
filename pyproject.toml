@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-layout-sort"
-version = "0.10.0"
-description = "Auto-arranges the current ComfyUI workflow into a clean layered layout based on its data flow, via node execution or a one-click button. Optional LM Studio integration suggests semantic clusters for ungrouped nodes."
+version = "0.11.0"
+description = "Auto-arranges the current ComfyUI workflow into a clean layered layout based on its data flow, via node execution or a one-click button. Optionally, a natural-language prompt (via LM Studio/Ollama/OpenAI/Anthropic) steers direction, spacing, group mode, style and named clusters — geometry stays deterministic."
 requires-python = ">=3.9"
 dependencies = []
 

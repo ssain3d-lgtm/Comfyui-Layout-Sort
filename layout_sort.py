@@ -8,10 +8,13 @@ Two ways to trigger a sort:
     the frontend POSTs the current graph to /layout_sort/compute and
     applies the returned positions immediately, no queue needed.
 
-Optionally, LM Studio (or any OpenAI-compatible local server) can suggest
-semantic clusters for nodes that are not inside any group; those clusters
-are laid out like groups and created as named frames on the canvas. Every
-LLM failure falls back to a plain sort.
+Optionally, typing a request into the node's llm_prompt widget routes it
+through an LLM (LM Studio/Ollama locally, or the OpenAI/Anthropic APIs):
+the model reads a digest of the workflow and translates the request into
+the sorter's own controls — direction, spacings, group mode, style, and
+named clusters for ungrouped nodes. The model never places nodes, and an
+empty prompt never contacts any LLM. Every LLM failure falls back to a
+plain sort with the widget settings.
 """
 
 import asyncio
@@ -20,20 +23,14 @@ import json
 import os
 import tempfile
 
-from .layout_core import (
-    _center,
-    _group_contains,
-    _normalize_groups,
-    _normalize_nodes,
-    compute_layout,
-)
+from .layout_core import compute_layout
 from .llm_client import (
     DEFAULT_BASE_URL,
     format_origin,
     is_valid_api_key,
     list_models,
+    plan_layout,
     resolve_base_url,
-    suggest_clusters,
 )
 
 WS_EVENT = "layout_sort_apply"
@@ -48,10 +45,6 @@ STYLE_PRESETS = {
     # for small graphs.
     "grid": {"align": "top"},
 }
-
-# With fewer ungrouped nodes than this, LLM clustering has nothing useful
-# to do (it only ever groups ungrouped nodes) — skip the call entirely.
-MIN_UNGROUPED_FOR_LLM = 4
 
 # The API key is intentionally NOT a node widget: widget values get
 # serialized into workflow JSON and PNG metadata, leaking the secret with
@@ -143,19 +136,14 @@ def store_api_key(key, allowed_origin=None):
         pass
 
 
-def _ungrouped_count(workflow):
-    nodes = _normalize_nodes(workflow)
-    groups = _normalize_groups(workflow)
-    return sum(
-        1 for node in nodes.values()
-        if not any(_group_contains(g, *_center(node)) for g in groups)
-    )
-
-
 def run_layout(workflow, options, llm_cfg=None):
-    """Shared pipeline for the node and the HTTP route: optionally ask the
-    local LLM for clusters, then compute the layout (falling back to a
-    plain sort whenever the LLM is unavailable)."""
+    """Shared pipeline for the node and the HTTP route.
+
+    With a non-empty llm_cfg["prompt"], the LLM first translates the
+    request into validated engine options (which win over the widget
+    values for this run) and optional named clusters; geometry itself is
+    always computed deterministically. An empty prompt — or any LLM
+    failure — is a plain sort with the widget settings."""
     if not workflow.get("nodes") and any(
         isinstance(v, dict) and "class_type" in v
         for v in workflow.values() if isinstance(v, dict)
@@ -167,34 +155,22 @@ def run_layout(workflow, options, llm_cfg=None):
             "data); load it into ComfyUI and sort the live graph instead"
         )
     options = dict(options or {})
-    style = STYLE_PRESETS.get(str(options.pop("style", "") or "").lower())
-    if style:
-        options = {**style,
-                   **{k: v for k, v in options.items() if v is not None}}
     extra_clusters = None
     llm_info = None
-    use_llm = bool(llm_cfg and llm_cfg.get("enabled"))
-    if use_llm and (options.get("group_mode") or "cluster") != "cluster":
-        llm_info = {"used": False,
-                    "error": 'group_mode must be "cluster" for LLM clustering'}
-    elif use_llm and _ungrouped_count(workflow) < MIN_UNGROUPED_FOR_LLM:
-        # The LLM only ever organizes ungrouped nodes; on an
-        # already-grouped workflow the call would just burn time.
-        llm_info = {"used": False,
-                    "skipped": "workflow is already organized by groups — "
-                               "too few ungrouped nodes for LLM clustering"}
-    elif use_llm:
+    prompt = str((llm_cfg or {}).get("prompt") or "").strip()
+    if prompt:
         # Priority: explicit (programmatic callers, who paired key and URL
         # themselves) > stored file (bound to its saved origin) > env var
-        # (gated inside suggest_clusters).
+        # (gated inside plan_layout).
         explicit_key = (llm_cfg.get("api_key") or "").strip()
         if explicit_key:
             api_key, key_origin = explicit_key, "*"
         else:
             stored = load_stored_key_info()
             api_key, key_origin = stored["api_key"], stored["allowed_origin"]
-        clusters, error = suggest_clusters(
-            workflow,
+        plan, error = plan_layout(
+            workflow, prompt,
+            current_options=options,
             base_url=resolve_base_url(llm_cfg.get("provider"),
                                       llm_cfg.get("base_url")),
             model=llm_cfg.get("model") or "",
@@ -206,20 +182,29 @@ def run_layout(workflow, options, llm_cfg=None):
         if error:
             llm_info = {"used": False, "error": error}
         else:
-            extra_clusters = clusters
-            llm_info = {"used": True}
+            options.update(plan["options"])
+            extra_clusters = plan["clusters"] or None
+            llm_info = {"used": True, "note": plan["note"],
+                        "applied": plan["options"],
+                        "unsupported": list(plan["unsupported"])}
+            if (extra_clusters
+                    and (options.get("group_mode") or "cluster") != "cluster"):
+                # compute_layout only materializes clusters in cluster
+                # mode; say so instead of silently dropping them.
+                llm_info["unsupported"].append(
+                    'clusters need group_mode "cluster"')
+                extra_clusters = None
+    style = STYLE_PRESETS.get(str(options.pop("style", "") or "").lower())
+    if style:
+        options = {**style,
+                   **{k: v for k, v in options.items() if v is not None}}
     result = compute_layout(workflow, options, extra_clusters)
-    if llm_info and llm_info.get("used"):
+    if llm_info and llm_info.get("used") and extra_clusters:
         # Report what actually got created: geometric filtering inside
         # compute_layout (existing groups win) can drop suggestions.
         created = result.get("new_groups") or []
-        if created:
-            llm_info["clusters"] = len(created)
-            llm_info["names"] = [g["title"] for g in created]
-        else:
-            llm_info = {"used": False,
-                        "error": "all suggested clusters were already "
-                                 "covered by existing groups"}
+        llm_info["clusters"] = len(created)
+        llm_info["names"] = [g["title"] for g in created]
     if llm_info:
         result["llm"] = llm_info
     return result
@@ -398,21 +383,25 @@ class LayoutSort:
                                 "sizes are never changed."},
                 ),
                 "animate": ("BOOLEAN", {"default": True}),
-                "llm_clustering": (
-                    "BOOLEAN",
-                    {"default": False,
-                     "tooltip": "Ask an LLM (local LM Studio/Ollama, or "
-                                "OpenAI/Anthropic cloud) to group ungrouped "
-                                "nodes by function and create named frames "
-                                "for them. Falls back to a plain sort when "
-                                "the server is unreachable."},
+                "llm_prompt": (
+                    "STRING",
+                    {"default": "", "multiline": True,
+                     "tooltip": "Optional. Describe how you want the sort "
+                                "in plain language (any language) — e.g. "
+                                "\"vertical, keep my groups, only tidy "
+                                "insides\" or \"tighter spacing, group the "
+                                "VAE nodes\". An LLM translates it into "
+                                "this node's own settings; it never places "
+                                "nodes itself. Leave empty for a plain "
+                                "sort with no LLM involved."},
                 ),
                 "llm_provider": (
                     ["lmstudio", "ollama", "openai", "anthropic", "custom"],
                     {"default": "lmstudio",
-                     "tooltip": "Where the LLM runs. lmstudio/ollama = "
-                                "local; openai = ChatGPT API; anthropic = "
-                                "Claude API; custom = use llm_base_url."},
+                     "tooltip": "Where the LLM runs (only used when "
+                                "llm_prompt is not empty). lmstudio/ollama "
+                                "= local; openai = ChatGPT API; anthropic "
+                                "= Claude API; custom = use llm_base_url."},
                 ),
                 "llm_base_url": (
                     "STRING",
@@ -468,7 +457,7 @@ class LayoutSort:
         return True
 
     def sort(self, direction, layer_spacing, node_spacing, group_mode, style,
-             animate, llm_clustering, llm_provider, llm_base_url, llm_model,
+             animate, llm_prompt, llm_provider, llm_base_url, llm_model,
              llm_max_tokens, trigger=None, extra_pnginfo=None, unique_id=None):
         workflow = (extra_pnginfo or {}).get("workflow")
         server = getattr(PromptServer, "instance", None) if PromptServer else None
@@ -484,7 +473,7 @@ class LayoutSort:
                 "style": style,
             },
             {
-                "enabled": llm_clustering,
+                "prompt": llm_prompt,
                 "provider": llm_provider,
                 "base_url": llm_base_url,
                 "model": llm_model,

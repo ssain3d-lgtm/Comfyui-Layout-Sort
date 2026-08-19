@@ -8,8 +8,10 @@
 A ComfyUI custom node that auto-arranges the current workflow into a clean,
 left-to-right layered layout based on its data flow. Trigger it by executing
 the node, or instantly with the **✨ Sort now** button. No AI required —
-with an optional LM Studio integration that suggests semantic clusters for
-ungrouped nodes and creates named group frames for them.
+optionally, type a natural-language request into `llm_prompt` ("vertical,
+keep my groups, tighter spacing, group the VAE nodes...") and an LLM
+(LM Studio/Ollama/OpenAI/Anthropic) translates it into the sorter's own
+controls; geometry always stays deterministic.
 
 ## 설치 (Install)
 
@@ -41,7 +43,7 @@ ComfyUI를 재시작하면 `utils/layout` 카테고리에 **Layout Sort (Auto Ar
 | `group_mode` | `cluster` | 그룹 처리 방식 (아래 참조) |
 | `style` | `flow` | 정렬 스타일 (아래 참조) |
 | `animate` | `true` | 노드 이동 애니메이션 |
-| `llm_clustering` | `false` | LLM으로 그룹 없는 노드를 기능별 클러스터링 (아래 참조) |
+| `llm_prompt` | (빈칸) | 자연어 정렬 지시. 비워두면 LLM을 전혀 쓰지 않음 (아래 참조) |
 | `llm_provider` | `lmstudio` | `lmstudio` / `ollama` / `openai`(ChatGPT) / `anthropic`(Claude) / `custom` |
 | `llm_base_url` | `http://127.0.0.1:1234/v1` | `custom`일 때 사용할 엔드포인트 |
 | `llm_model` | `auto` | 사용할 모델. `auto`면 서버의 첫 로드 모델 자동 선택 |
@@ -96,24 +98,32 @@ JSON에 케이블이 없지만, 정렬기가 같은 키의 Set → Get을 **레�
 두 스타일 모두 좌표를 10px 캔버스 그리드에 스냅하며, **노드 크기는 절대
 변경하지 않습니다** — 정렬기는 위치만 옮깁니다.
 
-## LLM 클러스터 제안 (LM Studio 연동)
+## 프롬프트로 정렬 지시하기 (LLM 연동, 선택)
 
-그룹이 없는 스파게티 워크플로우에서는 링크 구조만으로 "어디까지가 한 기능
-단위인지"를 알 수 없습니다. `llm_clustering`을 켜면 로컬 LLM에게 노드
-목록(타입·제목·서브그래프 이름 해석 포함)과 연결 관계를 보내 기능별
-클러스터를 제안받고, 그 결과를 클러스터 배치에 반영한 뒤 **이름 붙은 그룹
-프레임을 캔버스에 자동 생성**합니다.
+`llm_prompt`에 원하는 정렬을 **평소 말하듯** 적으면 됩니다 (한국어 등
+어떤 언어든). 예시:
 
-**역할 범위**: LLM은 오직 "그룹에 속하지 않은 노드"만 묶습니다. 이미
-그룹으로 정리된 워크플로우에서는 할 일이 없으므로, 그룹 밖 노드가 4개
-미만이면 **LLM 호출 자체를 건너뛰고** 그 사실을 토스트로 알립니다 —
-켜져 있어도 시간을 낭비하지 않습니다.
+- "세로로 정렬해줘" → `direction: top_to_bottom`
+- "그룹 위치는 그대로 두고 안쪽만 정리해" → `group_mode: inner`
+- "간격을 더 좁게, 딱 떨어지는 느낌으로" → 간격 축소 + `style: grid`
+- "VAE 관련 노드끼리 묶어줘" → 이름 붙은 클러스터 프레임 생성
+
+LLM은 실제 워크플로우 요약(노드 타입·제목·링크·기존 그룹·현재 설정)을
+읽고, 요청을 **이 노드가 원래 가진 컨트롤**(방향·간격·그룹 모드·스타일
++ 미그룹 노드 클러스터)로 번역한 JSON 계획만 돌려줍니다. 번역된 옵션은
+그 실행 1회에 한해 위젯 값보다 우선하고, **좌표 계산은 언제나 결정론
+엔진이 수행**합니다 — LLM이 노드를 직접 배치하는 일은 없습니다.
+
+정직 고지: 엔진 밖의 요청(특정 픽셀 위치 지정, 노드 크기·색 변경, 연결
+재배선 등)은 흉내내지 않고 "지원 안 됨" 토스트로 알려줍니다. 계획이
+무엇을 설정했는지는 성공 토스트 한 줄로 요약됩니다. `llm_prompt`가
+비어 있으면 **LLM은 단 한 번도 호출되지 않습니다.**
 
 사용법:
 
 1. [LM Studio](https://lmstudio.ai)를 실행하고 모델(예: Qwen 계열)을 로드한 뒤
    **Local Server**를 켭니다 (기본 `http://127.0.0.1:1234`).
-2. Layout Sort 노드에서 `llm_clustering`을 `true`로 바꾸고 정렬을 실행합니다.
+2. Layout Sort 노드의 `llm_prompt`에 원하는 지시를 적고 정렬을 실행합니다.
    Ollama 등 다른 OpenAI 호환 서버는 `llm_base_url`만 바꾸면 됩니다.
 
 **API 토큰**: LM Studio 로컬 서버는 기본 설정에서 토큰 없이 동작합니다.
@@ -169,12 +179,17 @@ JSON과 생성 이미지 PNG 메타데이터에 저장되어 공유 시 그대�
 
 동작 규칙:
 
-- **기존 그룹이 항상 우선입니다.** LLM 클러스터는 어떤 그룹에도 속하지 않은
+- 계획의 옵션은 **화이트리스트 검증**을 거칩니다: 허용된 5개 컨트롤 외의
+  키는 버려지고, 간격은 10~600px로 클램프됩니다 — 모델이 혼란스러워도
+  엔진 내부 옵션을 건드릴 수 없습니다.
+- **기존 그룹이 항상 우선입니다.** 클러스터는 어떤 그룹에도 속하지 않은
   노드만 가져갈 수 있습니다. 이미 정리된 부분은 절대 건드리지 않습니다.
-- 멤버가 2개 미만인 클러스터, 존재하지 않는 노드 ID는 자동으로 걸러집니다.
-- LLM 서버가 꺼져 있거나 응답이 이상하면 **일반 정렬로 자동 폴백**하고
-  우측 상단 토스트로 사유를 알려줍니다. 정렬 자체는 항상 동작합니다.
-- `group_mode`가 `cluster`일 때만 동작합니다.
+- 멤버가 2개 미만인 클러스터, 존재하지 않는 노드 ID는 자동으로 걸러지고,
+  클러스터 생성은 `group_mode: cluster`에서만 반영됩니다(아니면 "지원 안
+  됨"으로 알림).
+- LLM 서버가 꺼져 있거나 응답이 이상하면 **위젯 설정 그대로 일반 정렬로
+  자동 폴백**하고 우측 상단 토스트로 사유를 알려줍니다. 정렬 자체는 항상
+  동작합니다.
 - thinking 모델의 `<think>` 블록, 마크다운 코드펜스, 잡담 섞인 응답도
   방어적으로 파싱합니다. 구조화 출력(json_schema)을 지원하지 않는 서버는
   자동으로 일반 모드로 재시도합니다.
@@ -214,7 +229,7 @@ JSON과 생성 이미지 PNG 메타데이터에 저장되어 공유 시 그대�
 
 ```bash
 python3 tests/test_layout.py    # 레이아웃 엔진 (NaN 방어, 그룹 주차 포함)
-python3 tests/test_llm_e2e.py   # 목(mock) LM Studio 서버로 LLM 경로 E2E
+python3 tests/test_llm_e2e.py   # 목(mock) 서버로 프롬프트 계획 경로 E2E
 python3 tests/test_routes.py    # aiohttp 라우트 계층 (키 저장/검증 포함)
 ```
 
@@ -222,9 +237,9 @@ python3 tests/test_routes.py    # aiohttp 라우트 계층 (키 저장/검증 �
 
 **Q. AI(LLM)가 꼭 필요한가요?**
 아니요. 핵심 정렬은 결정적 알고리즘만으로 빠르고(수십 ms) 재현 가능하게
-동작합니다. LLM은 "그룹이 전혀 없는 워크플로우의 의미 단위 클러스터
-제안"이라는 부가 기능에만 옵션으로 쓰이며(`llm_clustering`, 위 섹션 참조),
-LLM 서버가 없으면 언제나 일반 정렬로 폴백합니다.
+동작합니다. LLM의 역할은 딱 하나 — `llm_prompt`에 적은 자연어 지시를
+이 노드의 컨트롤로 번역하는 것(위 섹션 참조)입니다. 프롬프트가 비어
+있으면 호출 자체가 없고, LLM 서버가 없으면 언제나 일반 정렬로 폴백합니다.
 
 **Q. "reply contains no JSON" 오류가 떠요.**
 대부분 **thinking 모델**(qwen3 등)이 원인입니다. 이런 모델은 답을 내기
@@ -271,7 +286,7 @@ LLM 서버가 없으면 언제나 일반 정렬로 폴백합니다.
 __init__.py       # 노드/웹 디렉토리 등록
 layout_sort.py    # LayoutSort 노드 + /layout_sort/compute 엔드포인트 + 웹소켓 푸시
 layout_core.py    # 순수 Python 레이아웃 엔진 (ComfyUI 없이 단독 테스트 가능)
-llm_client.py     # LM Studio(OpenAI 호환) 클러스터 제안 클라이언트 (stdlib만 사용)
+llm_client.py     # 프롬프트→정렬 계획 번역 LLM 클라이언트 (stdlib만 사용)
 web/layoutSort.js # 좌표 적용(애니메이션), Sort now 버튼, 그룹 생성, 토스트
 tests/            # 단위 테스트 + 목 LM Studio E2E 테스트
 ```

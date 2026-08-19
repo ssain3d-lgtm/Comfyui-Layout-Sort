@@ -81,30 +81,39 @@ function createGroups(newGroups) {
 }
 
 function notifyLlm(llm) {
+    // Only present when llm_prompt was non-empty; an empty prompt runs a
+    // plain deterministic sort with no LLM involved and stays silent.
     const toast = app.extensionManager?.toast;
     if (!llm) return;
-    if (llm.skipped) {
-        toast?.add?.({
-            severity: "info",
-            summary: "Layout Sort",
-            detail: `LLM clustering skipped: ${llm.skipped}`,
-            life: 4000,
-        });
-    } else if (llm.error) {
-        console.warn("[LayoutSort] LLM clustering skipped:", llm.error);
+    if (llm.error) {
+        console.warn("[LayoutSort] LLM prompt ignored:", llm.error);
         toast?.add?.({
             severity: "warn",
             summary: "Layout Sort",
-            detail: `LLM clustering skipped: ${llm.error}`,
+            detail: `Prompt ignored (plain sort used): ${llm.error}`,
             life: 6000,
         });
-    } else if (llm.used) {
+        return;
+    }
+    if (llm.used) {
+        let detail = llm.note || "Prompt applied.";
+        if (llm.clusters > 0) {
+            detail += ` — ${llm.clusters} frame(s): ${(llm.names ?? []).join(", ")}`;
+        }
         toast?.add?.({
             severity: "success",
             summary: "Layout Sort",
-            detail: `LLM suggested ${llm.clusters} clusters: ${(llm.names ?? []).join(", ")}`,
+            detail,
             life: 5000,
         });
+        if (llm.unsupported?.length) {
+            toast?.add?.({
+                severity: "warn",
+                summary: "Layout Sort",
+                detail: `Not possible: ${llm.unsupported.join("; ")}`,
+                life: 6000,
+            });
+        }
     }
 }
 
@@ -180,7 +189,7 @@ async function sortNow(node) {
     // The API key is deliberately absent here: it lives server-side only
     // (key dialog / env var) and must never enter the graph or this payload.
     const llm = {
-        enabled: widgetValue(node, "llm_clustering", false),
+        prompt: widgetValue(node, "llm_prompt", ""),
         provider: widgetValue(node, "llm_provider", "lmstudio"),
         base_url: widgetValue(node, "llm_base_url", ""),
         model: widgetValue(node, "llm_model", ""),
@@ -360,6 +369,11 @@ function sanitizeWidgets(node) {
         } else {
             widget.value = values[0];
         }
+    }
+    const promptWidget = get("llm_prompt");
+    if (promptWidget && typeof promptWidget.value !== "string") {
+        // Saves from the llm_clustering era carry a boolean in this slot.
+        promptWidget.value = "";
     }
     const baseUrl = get("llm_base_url");
     if (baseUrl && (typeof baseUrl.value !== "string" || baseUrl.value === ""
