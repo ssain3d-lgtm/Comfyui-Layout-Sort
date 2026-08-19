@@ -194,7 +194,8 @@ function widgetValue(node, name, fallback) {
 }
 
 function isGroupItem(item) {
-    return typeof item?.recomputeInsideNodes === "function";
+    return !!item && (typeof item.recomputeInsideNodes === "function"
+        || item.constructor?.name === "LGraphGroup");
 }
 
 function selectedNodes() {
@@ -230,11 +231,34 @@ function selectedGroups() {
     return found;
 }
 
+function nodeVisualCenter(n) {
+    // Mirrors the backend's membership rule exactly (visual rect incl.
+    // the title bar; collapsed nodes render at roughly title width).
+    const collapsed = !!n.flags?.collapsed;
+    const w = collapsed ? Math.min(n.size?.[0] ?? 1, 160)
+                        : Math.max(n.size?.[0] ?? 1, 1);
+    const bodyH = collapsed ? 0 : Math.max(n.size?.[1] ?? 1, 1);
+    return [n.pos[0] + w / 2, n.pos[1] - 30 + (bodyH + 30) / 2];
+}
+
+function groupRect(group) {
+    return [group.pos[0], group.pos[1], group.size[0], group.size[1]];
+}
+
 function groupMembers(group) {
-    try {
-        group.recomputeInsideNodes();
-    } catch (err) { /* membership stays as last computed */ }
-    return group._nodes ?? group.nodes ?? [];
+    // Geometric membership (center inside the frame) instead of
+    // LiteGraph's _nodes cache — identical across frontend generations
+    // and to the backend's rule.
+    const [gx, gy, gw, gh] = groupRect(group);
+    const members = [];
+    for (const n of app.graph?._nodes ?? []) {
+        if (n?.id == null || !n.pos) continue;
+        const [cx, cy] = nodeVisualCenter(n);
+        if (cx >= gx && cx <= gx + gw && cy >= gy && cy <= gy + gh) {
+            members.push(n);
+        }
+    }
+    return members;
 }
 
 function selectionScope() {
@@ -252,14 +276,12 @@ function selectionScope() {
 function selectedZone() {
     // A selected EMPTY group frame is a drawn target zone: the sort
     // shapes the layout to its proportions and lands it at its corner.
+    // The index is a hint only — the backend re-resolves the frame by
+    // its rectangle, so a proxy-broken indexOf (-1) still works.
     for (const group of selectedGroups()) {
         if (groupMembers(group).length) continue;
-        const index = graphGroups().indexOf(group);
-        if (index >= 0) {
-            return { rect: [group.pos[0], group.pos[1],
-                            group.size[0], group.size[1]],
-                     index };
-        }
+        return { rect: groupRect(group),
+                 index: graphGroups().indexOf(group) };
     }
     return null;
 }
@@ -469,7 +491,14 @@ async function sortNow(node) {
             toolToast(`Sorted ${moved} selected node(s); the rest stayed put.`);
         }
         if (options.zone) {
-            toolToast("Arranged into the drawn zone (frame kept as is).");
+            // Truthful feedback: the backend reports whether the zone
+            // was actually matched and used.
+            if (result.zone?.applied) {
+                toolToast("Arranged into the drawn zone (frame kept as is).");
+            } else {
+                toolToast(`Zone not used: ${result.zone?.reason
+                    ?? "the drawn frame could not be matched"}`, "warn");
+            }
         }
     } catch (err) {
         console.error("[LayoutSort] sort request failed:", err);

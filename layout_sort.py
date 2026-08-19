@@ -191,6 +191,44 @@ def _scoped_workflow(workflow, scope_ids):
     return scoped, index_map
 
 
+ZONE_MATCH_TOLERANCE = 3.0
+
+
+def _resolve_zone_group(workflow, rect, index_hint):
+    """Index of the EMPTY group frame matching the drawn rect.
+
+    A frontend's group index can drift from the serialized order (Vue
+    proxies make identity lookups unreliable), so the rectangle is the
+    source of truth: the hinted index is only tried first. Returns
+    (index, None) or (None, reason)."""
+    groups = _normalize_groups(workflow)
+    if not groups:
+        return None, "the workflow has no group frames"
+    nodes = _normalize_nodes(workflow)
+
+    def matches(g):
+        return (abs(g["x"] - rect[0]) <= ZONE_MATCH_TOLERANCE
+                and abs(g["y"] - rect[1]) <= ZONE_MATCH_TOLERANCE
+                and abs(g["w"] - rect[2]) <= ZONE_MATCH_TOLERANCE
+                and abs(g["h"] - rect[3]) <= ZONE_MATCH_TOLERANCE)
+
+    def empty(g):
+        return not any(_group_contains(g, *_center(n))
+                       for n in nodes.values())
+
+    ordered = list(groups)
+    if isinstance(index_hint, int):
+        ordered.sort(key=lambda g: g["index"] != index_hint)
+    for group in ordered:
+        if not matches(group):
+            continue
+        if empty(group):
+            return group["index"], None
+        return None, ("the selected frame contains nodes — a zone must "
+                      "be an empty frame")
+    return None, "no group frame matches the drawn rectangle"
+
+
 def _drop_empty_group(workflow, index):
     """Remove group `index` when it is verifiably EMPTY (a drawn zone).
 
@@ -260,21 +298,37 @@ def run_layout(workflow, options, llm_cfg=None, progress=None):
     # itself is dropped from the compute copy (it is the specification,
     # not content) and stays exactly where the user drew it.
     zone_rect = None
+    zone_status = None
     raw_zone = options.pop("zone", None)
     zone_index = options.pop("zone_index", None)
     group_index_map = None
-    if (group_mode != "inner"
-            and isinstance(raw_zone, (list, tuple)) and len(raw_zone) >= 4):
+    if isinstance(raw_zone, (list, tuple)) and len(raw_zone) >= 4:
         try:
             candidate = [float(v) for v in raw_zone[:4]]
         except (TypeError, ValueError):
             candidate = None
-        if candidate and candidate[2] > 0 and candidate[3] > 0:
-            workflow, group_index_map = _drop_empty_group(workflow,
-                                                          zone_index)
-            if group_index_map is not None:
+        if not candidate or candidate[2] <= 0 or candidate[3] <= 0:
+            zone_status = {"applied": False,
+                           "reason": "invalid zone rectangle"}
+        elif group_mode == "inner":
+            zone_status = {"applied": False,
+                           "reason": 'zones need group_mode "cluster" or '
+                                     '"refit" — inner keeps your macro '
+                                     "layout in place"}
+        else:
+            resolved, reason = _resolve_zone_group(workflow, candidate,
+                                                   zone_index)
+            if resolved is not None:
+                workflow, group_index_map = _drop_empty_group(workflow,
+                                                              resolved)
+            if resolved is None or group_index_map is None:
+                zone_status = {"applied": False,
+                               "reason": reason
+                               or "zone frame could not be detached"}
+            else:
                 zone_rect = candidate
                 options["zone_size"] = [candidate[2], candidate[3]]
+                zone_status = {"applied": True, "reason": None}
 
     scope_ids = options.pop("scope_ids", None)
     if scope_ids:
@@ -339,8 +393,18 @@ def run_layout(workflow, options, llm_cfg=None, progress=None):
             for u in result.get("groups") or []
             if u["index"] in group_index_map
         ]
-    if (zone_rect is not None and result.get("positions")
-            and (options.get("group_mode") or "cluster") != "inner"):
+    if zone_rect is not None and (
+            not result.get("positions")
+            or (options.get("group_mode") or "cluster") == "inner"):
+        # The plan switched to inner mid-run, or nothing was placed:
+        # report honestly instead of pretending the zone was used.
+        zone_status = {"applied": False,
+                       "reason": "nothing was placed into the zone"
+                       if not result.get("positions") else
+                       'the prompt switched group_mode to "inner", which '
+                       "keeps your macro layout in place"}
+        zone_rect = None
+    if zone_rect is not None:
         # Land the reshaped content at the drawn box's corner (snapped so
         # the grid alignment survives). Sizes are never scaled: content
         # larger than the box overflows right/down at the box's ratio.
@@ -365,6 +429,8 @@ def run_layout(workflow, options, llm_cfg=None, progress=None):
             for p in (result.get("reroutes") or {}).values():
                 p[0] += dx
                 p[1] += dy
+    if zone_status is not None:
+        result["zone"] = zone_status
     # Frame updates are index-based; the frontend compares this against
     # the live graph so frames added/removed during a slow LLM round-trip
     # can never receive another frame's geometry.

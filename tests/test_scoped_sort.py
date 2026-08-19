@@ -94,6 +94,7 @@ def main():
                                                        2400, 1600]})
     res = layout_sort.run_layout(wf, {"zone": [5000, 7000, 2400, 1600],
                                       "zone_index": 2})
+    assert res["zone"] == {"applied": True, "reason": None}, res.get("zone")
     # content lands at the drawn corner (snap tolerance)
     nodes = node_map(wf)
     min_x = min(min(p[0] for p in res["positions"].values()),
@@ -115,13 +116,35 @@ def main():
                                        res["positions"][str(nid)]), bounding)
     print("zone fit OK")
 
+    # --- wrong index hint, right rectangle: the rect wins (frontends
+    # with proxy-broken indexOf send -1 or a stale index)
+    for bad_hint in (-1, 0, None):
+        wf = two_group_workflow()
+        wf["groups"].append({"title": "Zone",
+                             "bounding": [5000, 7000, 2400, 1600]})
+        res = layout_sort.run_layout(
+            wf, {"zone": [5000, 7000, 2400, 1600], "zone_index": bad_hint})
+        assert res["zone"]["applied"] is True, (bad_hint, res.get("zone"))
+        assert 2 not in {u["index"] for u in res["groups"]}
+    print("zone rect resolution OK")
+
     # --- a POPULATED group offered as a zone is refused (it is content)
     wf = two_group_workflow()
     res = layout_sort.run_layout(wf, {"zone": [50, 100, 500, 500],
                                       "zone_index": 0})
     assert {u["index"] for u in res["groups"]} == {0, 1}, \
         "populated zone candidate must sort normally"
+    assert res["zone"]["applied"] is False \
+        and "contains nodes" in res["zone"]["reason"], res["zone"]
     print("populated zone refused OK")
+
+    # --- a rect matching no frame is reported honestly
+    res = layout_sort.run_layout(two_group_workflow(),
+                                 {"zone": [9999, 9999, 500, 500],
+                                  "zone_index": 5})
+    assert res["zone"]["applied"] is False \
+        and "matches" in res["zone"]["reason"], res["zone"]
+    print("unmatched zone reported OK")
 
     print("ALL SCOPED-SORT TESTS PASSED")
 
