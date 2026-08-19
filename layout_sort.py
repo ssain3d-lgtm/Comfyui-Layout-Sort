@@ -199,6 +199,10 @@ def run_layout(workflow, options, llm_cfg=None):
         options = {**style,
                    **{k: v for k, v in options.items() if v is not None}}
     result = compute_layout(workflow, options, extra_clusters)
+    # Frame updates are index-based; the frontend compares this against
+    # the live graph so frames added/removed during a slow LLM round-trip
+    # can never receive another frame's geometry.
+    result["group_count"] = len(workflow.get("groups") or [])
     if llm_info and llm_info.get("used") and extra_clusters:
         # Report what actually got created: geometric filtering inside
         # compute_layout (existing groups win) can drop suggestions.
@@ -218,7 +222,20 @@ except ImportError:
     # is still importable, only the live push/route are unavailable.
     PromptServer = None
 else:
+    def _reject_non_json(request):
+        """CSRF hardening: browsers can fire cross-site POSTs without a
+        preflight only for form/text content types; requiring the JSON
+        content type (which our frontend always sends) forces CORS."""
+        if request.content_type != "application/json":
+            return web.json_response(
+                {"error": "content-type must be application/json"},
+                status=400)
+        return None
+
     async def _layout_sort_compute(request):
+        rejected = _reject_non_json(request)
+        if rejected is not None:
+            return rejected
         try:
             data = await request.json()
         except Exception:
@@ -258,6 +275,9 @@ else:
         return _key_status()
 
     async def _layout_sort_key_set(request):
+        rejected = _reject_non_json(request)
+        if rejected is not None:
+            return rejected
         try:
             data = await request.json()
         except Exception:
@@ -287,6 +307,9 @@ else:
         return _key_status()
 
     async def _layout_sort_models(request):
+        rejected = _reject_non_json(request)
+        if rejected is not None:
+            return rejected
         try:
             data = await request.json()
         except Exception:
@@ -490,6 +513,7 @@ class LayoutSort:
             "llm": result.get("llm"),
             "animate": bool(animate),
             "source_node": unique_id,
+            "group_count": result.get("group_count"),
         }, sid)
         return {}
 

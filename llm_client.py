@@ -55,6 +55,9 @@ PLAN_SPACING_KEYS = ("h_spacing", "v_spacing")
 SPACING_MIN, SPACING_MAX = 10, 600
 MAX_NOTE_LENGTH = 200
 MAX_UNSUPPORTED = 8
+# Per-field cap inside the digest: one multi-megabyte node title in a
+# shared workflow must not balloon the LLM request.
+DIGEST_MAX_FIELD = 80
 
 SYSTEM_PROMPT = (
     "You translate a user's natural-language layout request for a ComfyUI "
@@ -181,7 +184,8 @@ def build_digest(workflow, current_options=None):
     definitions = workflow.get("definitions") or {}
     for sub in definitions.get("subgraphs") or []:
         if isinstance(sub, dict) and sub.get("id") is not None:
-            subgraph_names[str(sub["id"])] = str(sub.get("name") or "Subgraph")
+            subgraph_names[str(sub["id"])] = \
+                str(sub.get("name") or "Subgraph")[:DIGEST_MAX_FIELD]
 
     group_rects = _group_rects(workflow)
 
@@ -203,7 +207,8 @@ def build_digest(workflow, current_options=None):
         node_type = str(raw.get("type") or "?")
         if node_type in subgraph_names:
             node_type = f"[subgraph] {subgraph_names[node_type]}"
-        title = str(raw.get("title") or "")
+        node_type = node_type[:DIGEST_MAX_FIELD]
+        title = str(raw.get("title") or "")[:DIGEST_MAX_FIELD]
         suffix = f" | {title}" if title and title != node_type else ""
         lines.append(f"{raw['id']} | {node_type}{suffix}")
         if not grouped(raw):
@@ -213,7 +218,8 @@ def build_digest(workflow, current_options=None):
 
     if group_rects:
         lines.append("EXISTING GROUP FRAMES (title):")
-        lines.extend(f"- {title}" for title, _r in group_rects)
+        lines.extend(f"- {title[:DIGEST_MAX_FIELD]}"
+                     for title, _r in group_rects)
     lines.append("UNGROUPED NODE IDS (the only ids usable in clusters): "
                  + (", ".join(ungrouped) if ungrouped else "(none)"))
 
@@ -534,15 +540,19 @@ def _validate_plan(parsed, workflow):
         for key in PLAN_SPACING_KEYS:
             value = raw_options.get(key)
             try:
+                # json.loads accepts the Infinity literal -> OverflowError
                 number = int(value)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 continue
             options[key] = max(SPACING_MIN, min(SPACING_MAX, number))
     clusters = _validate_clusters(parsed.get("clusters"), workflow)
     note = str(parsed.get("note") or "").strip()[:MAX_NOTE_LENGTH]
+    raw_unsupported = parsed.get("unsupported")
+    if not isinstance(raw_unsupported, list):
+        raw_unsupported = []
     unsupported = [
         str(item).strip()[:120]
-        for item in (parsed.get("unsupported") or [])[:MAX_UNSUPPORTED]
+        for item in raw_unsupported[:MAX_UNSUPPORTED]
         if str(item).strip()
     ]
     if not options and not clusters and not note and not unsupported:

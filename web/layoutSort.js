@@ -117,7 +117,8 @@ function notifyLlm(llm) {
     }
 }
 
-function applyLayout({ positions, groups, new_groups, reroutes, llm, animate }) {
+function applyLayout({ positions, groups, new_groups, reroutes, llm, animate,
+                       group_count }) {
     const moves = collectMoves(positions);
     if (!moves.length) return;
     // A broadcast event may reach a tab showing a different workflow;
@@ -139,7 +140,17 @@ function applyLayout({ positions, groups, new_groups, reroutes, llm, animate }) 
             m.node.pos[0] = m.to[0];
             m.node.pos[1] = m.to[1];
         }
-        applyGroups(groups);
+        // Frame updates target groups by array index, so they are only
+        // safe while the group list still matches the graph that was
+        // sorted (the user can add/remove frames during a slow LLM
+        // round-trip or the animation).
+        if (typeof group_count !== "number"
+                || graphGroups().length === group_count) {
+            applyGroups(groups);
+        } else {
+            console.warn("[LayoutSort] group frames changed during the "
+                + "sort; skipping frame updates");
+        }
         applyReroutes(reroutes);
         createGroups(new_groups);
         app.graph.afterChange?.();
@@ -210,6 +221,7 @@ async function sortNow(node) {
             reroutes: result.reroutes,
             llm: result.llm,
             animate: widgetValue(node, "animate", true),
+            group_count: result.group_count,
         });
     } catch (err) {
         console.error("[LayoutSort] sort request failed:", err);
@@ -371,9 +383,18 @@ function sanitizeWidgets(node) {
         }
     }
     const promptWidget = get("llm_prompt");
-    if (promptWidget && typeof promptWidget.value !== "string") {
-        // Saves from the llm_clustering era carry a boolean in this slot.
-        promptWidget.value = "";
+    if (promptWidget) {
+        // Positional restores from every earlier widget vintage leave
+        // non-prompt values here: a boolean (llm_clustering era), a
+        // provider name or a base URL (older eras). None of those are a
+        // layout request, and a non-empty prompt triggers an LLM call —
+        // only text the user actually typed may survive.
+        const v = promptWidget.value;
+        const s = typeof v === "string" ? v.trim() : null;
+        if (s === null || /^https?:\/\/\S+$/i.test(s)
+                || COMBO_VALUES.llm_provider.includes(s) || s === MODEL_AUTO) {
+            promptWidget.value = "";
+        }
     }
     const baseUrl = get("llm_base_url");
     if (baseUrl && (typeof baseUrl.value !== "string" || baseUrl.value === ""

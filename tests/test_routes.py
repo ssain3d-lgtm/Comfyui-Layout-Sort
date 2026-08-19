@@ -69,9 +69,11 @@ llm_client = sys.modules["Comfyui-Layout-Sort.llm_client"]
 
 
 class FakeRequest:
-    def __init__(self, body=None, raise_json=False):
+    def __init__(self, body=None, raise_json=False,
+                 content_type="application/json"):
         self._body = body
         self._raise = raise_json
+        self.content_type = content_type
 
     async def json(self):
         if self._raise:
@@ -109,6 +111,17 @@ def main():
                            "size": [100, 50], "flags": {}}], "links": []}
     r = call("POST", "/layout_sort/compute", FakeRequest(body={"workflow": workflow}))
     assert r.status == 200 and set(r.data["positions"]) == {"1"}, (r.status, r.data)
+    assert r.data["group_count"] == 0, r.data
+
+    # CSRF hardening: non-JSON content types are rejected before parsing
+    # on every POST route (browser form posts carry text/plain or
+    # form-urlencoded and never application/json without CORS).
+    for path in ("/layout_sort/compute", "/layout_sort/api_key",
+                 "/layout_sort/models"):
+        r = call("POST", path, FakeRequest(body={"workflow": workflow},
+                                           content_type="text/plain"))
+        assert r.status == 400 and "content-type" in r.data["error"], \
+            (path, r.status, r.data)
 
     r = call("POST", "/layout_sort/compute",
              FakeRequest(body={"workflow": workflow, "options": "boom"}))

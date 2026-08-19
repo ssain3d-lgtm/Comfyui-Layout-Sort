@@ -777,6 +777,39 @@ def case_empty_prompt_no_llm():
     assert "llm" not in res and not SERVER.snapshot()
 
 
+@case("19. malformed plan values drop, not fatal; digest caps long fields")
+def case_malformed_plan_values():
+    # json.loads accepts the Infinity literal; a dict where a list is
+    # expected must not raise either. The valid direction survives both.
+    SERVER.reset()
+    SERVER.chat_content = (
+        '{"options": {"direction": "top_to_bottom", "h_spacing": Infinity},'
+        ' "unsupported": {"a": "b"}, "note": "vertical"}'
+    )
+    plan, err = llm_client.plan_layout(
+        make_workflow(), PROMPT, base_url=BASE, model="", timeout=30)
+    assert err is None, f"malformed values must drop, not fail: {err!r}"
+    assert plan["options"] == {"direction": "top_to_bottom"}, plan["options"]
+    assert plan["unsupported"] == [] and plan["note"] == "vertical", plan
+
+    # A multi-megabyte node title must not balloon the request digest.
+    wf = make_workflow()
+    wf["nodes"][0]["title"] = "T" * 1_000_000
+    wf["groups"] = [{"title": "G" * 5000, "bounding": [0, 0, 10, 10]}]
+    digest = llm_client.build_digest(wf)
+    assert len(digest) < 20_000, f"digest ballooned to {len(digest)}"
+    assert "T" * 200 not in digest and "G" * 200 not in digest
+
+    # The staleness token for index-based frame updates is always present.
+    SERVER.reset()
+    SERVER.chat_content = CONTENT_HAPPY
+    wf = make_workflow(with_group=True)
+    res = layout_sort.run_layout(
+        wf, {}, {"prompt": PROMPT, "base_url": BASE, "model": ""})
+    assert res["group_count"] == 1, res.get("group_count")
+    assert layout_sort.run_layout(make_workflow(), {})["group_count"] == 0
+
+
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
