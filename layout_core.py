@@ -65,6 +65,10 @@ DEFAULT_OPTIONS = {
     # Round the final coordinates to this grid. Node sizes are never
     # touched — the sorter only moves things.
     "snap_grid": 10,
+    # Target canvas proportions: "auto" (natural), "square" (1:1),
+    # "wide" (2:1) or "tall" (1:2). Applies to the whole layout AND to
+    # every group interior in cluster/inner mode.
+    "shape": "auto",
 }
 
 GROUP_SIDE_PADDING = 24.0
@@ -421,21 +425,10 @@ def _place_layers(items, ordered_layers, direction, h_spacing, v_spacing,
     return positions, (main - h_spacing, max_breadth)
 
 
-def _place_islands(items, islands, main_extent, h_spacing, v_spacing):
-    """Shelf-pack unlinked items (notes etc.) in rows under the main flow."""
+def _shelf_pack(items, ordered, row_limit, v_spacing):
+    """Row-based shelf packing anchored at (0, 0): (positions, w, h)."""
     positions = {}
-    if not islands:
-        return positions
-    ordered = sorted(islands, key=lambda iid: (items[iid]["y"], items[iid]["x"]))
-    main_w, main_h = main_extent
-    # Aim for a roughly square shelf: with many/large islands (e.g. a
-    # container full of unconnected sub-groups) a fixed narrow row limit
-    # would stack them into one enormously tall column.
-    total_area = sum(items[iid]["w"] * items[iid]["h"] for iid in islands)
-    row_limit = max(main_w, 1200.0, 1.25 * math.sqrt(total_area))
-    x = 0.0
-    y = (main_h + max(h_spacing, v_spacing) * 2.0) if main_h > 0 else 0.0
-    row_height = 0.0
+    x = y = row_height = width = 0.0
     for iid in ordered:
         item = items[iid]
         if x > 0 and (x + item["w"]) > row_limit:
@@ -444,24 +437,210 @@ def _place_islands(items, islands, main_extent, h_spacing, v_spacing):
             row_height = 0.0
         positions[iid] = [x, y]
         x += item["w"] + v_spacing
+        width = max(width, x - v_spacing)
         row_height = max(row_height, item["h"])
-    return positions
+    return positions, width, y + row_height
+
+
+def _place_islands(items, islands, main_extent, h_spacing, v_spacing,
+                   shape_ratio=None):
+    """Shelf-pack unlinked items (notes etc.) next to the main flow.
+
+    Without a shape request the shelf always goes underneath. With one,
+    the shelf is packed both ways — underneath and to the right — and
+    whichever aggregate lands closer to the target W:H wins (a wide
+    target with a big island block below would otherwise always end up
+    tall)."""
+    if not islands:
+        return {}
+    ordered = sorted(islands, key=lambda iid: (items[iid]["y"], items[iid]["x"]))
+    main_w, main_h = main_extent
+    gap = max(h_spacing, v_spacing) * 2.0
+    total_area = sum(items[iid]["w"] * items[iid]["h"] for iid in islands)
+    widest = max(items[iid]["w"] for iid in islands)
+
+    def below(row_limit):
+        pos, w, h = _shelf_pack(items, ordered, row_limit, v_spacing)
+        offset = main_h + gap if main_h > 0 else 0.0
+        for p in pos.values():
+            p[1] += offset
+        return pos, max(main_w, w), (offset + h)
+
+    if not shape_ratio:
+        return below(max(main_w, 1200.0, 1.25 * math.sqrt(total_area)))[0]
+
+    cand_below = below(max(main_w, math.sqrt(total_area * shape_ratio),
+                           widest))
+    pos_r, w_r, h_r = _shelf_pack(
+        items, ordered,
+        max(math.sqrt(total_area * shape_ratio), widest), v_spacing)
+    offset = main_w + gap if main_w > 0 else 0.0
+    for p in pos_r.values():
+        p[0] += offset
+    cand_right = (pos_r, offset + w_r, max(main_h, h_r))
+
+    def badness(candidate):
+        _pos, width, height = candidate
+        return abs(math.log(max(width, 1.0) / max(height, 1.0)
+                            / shape_ratio))
+
+    return min(cand_below, cand_right, key=badness)[0]
+
+
+# Target width:height ratios for the "shape" option. The engine reshapes
+# toward the ratio with whichever mechanism fits: graphs taller than the
+# target get their breadth capped (layer wrapping), graphs longer than
+# the target get their layer sequence folded into serpentine bands the
+# way a human folds a long pipeline. Only one mechanism ever applies, so
+# they cannot compound.
+SHAPE_RATIOS = {"square": 1.0, "wide": 2.0, "tall": 0.5}
+SHAPE_PACK_FACTOR = 1.7   # content area -> canvas area (spacing overhead)
+SHAPE_SLACK = 1.25        # don't fold for less than 25% overshoot
+
+
+def _shape_targets(items, linked_ids, shape_ratio, direction):
+    """(breadth_cap, flow_cap) canvas targets for the requested ratio,
+    computed over the LINKED content only — islands are shelf-packed
+    separately (with their own ratio-aware row limit) and would otherwise
+    inflate the targets of the flow they are not part of."""
+    area = sum(items[i]["w"] * items[i]["h"]
+               for i in linked_ids) * SHAPE_PACK_FACTOR
+    if area <= 0:
+        return float("inf"), float("inf")
+    width = math.sqrt(area * shape_ratio)
+    height = math.sqrt(area / shape_ratio)
+    if direction == "top_to_bottom":
+        return width, height   # breadth is horizontal, flow is vertical
+    return height, width
+
+
+def _partition_bands(items, ordered_layers, direction, h_spacing, v_spacing,
+                     band_gap, shape_ratio, flow_cap=None):
+    """Fold the layer sequence into k serpentine bands.
+
+    With an explicit flow_cap (fit-into-a-drawn-zone), bands simply fill
+    up to that width. Otherwise k comes from solving flow'/breadth' =
+    target for the band count with the inter-band gap included: with
+    flow total F, mean layer breadth b and gap g, breadth after k bands
+    is k*b + (k-1)*g and flow is F/k, so (b+g)*k^2 - g*k - F/q = 0
+    (q = W:H for left_to_right, its inverse for top_to_bottom)."""
+    if len(ordered_layers) < 2:
+        return [ordered_layers]
+    flow_dim = "h" if direction == "top_to_bottom" else "w"
+    breadth_dim = "w" if direction == "top_to_bottom" else "h"
+    extents = [max(items[i][flow_dim] for i in col) for col in ordered_layers]
+    flow_total = sum(extents) + h_spacing * (len(extents) - 1)
+    if flow_cap is not None:
+        if flow_total <= flow_cap * 1.05:
+            return [ordered_layers]
+    else:
+        breadths = [
+            sum(items[i][breadth_dim] for i in col)
+            + v_spacing * (len(col) - 1)
+            for col in ordered_layers
+        ]
+        mean_breadth = sum(breadths) / len(breadths)
+        q = shape_ratio if direction != "top_to_bottom" else 1.0 / shape_ratio
+        unit = mean_breadth + band_gap
+        k = (band_gap + math.sqrt(band_gap * band_gap
+                                  + 4.0 * unit * flow_total / q)) / (2.0 * unit)
+        k = max(1, int(round(k)))
+        if k <= 1:
+            return [ordered_layers]
+        flow_cap = flow_total / k * 1.02  # slack so rounding still fits k
+    bands, current, used = [], [], 0.0
+    for column, extent in zip(ordered_layers, extents):
+        step = extent + (h_spacing if current else 0.0)
+        if current and used + step > flow_cap:
+            bands.append(current)
+            current, used = [], 0.0
+            step = extent
+        current.append(column)
+        used += step
+    if current:
+        bands.append(current)
+    return bands
 
 
 def _layered_layout(items, edges, direction, h_spacing, v_spacing, sweeps,
-                    wrap_breadth=0, align="top"):
+                    wrap_breadth=0, align="top", shape_ratio=None,
+                    zone_size=None):
     """Run the full layered pipeline. Returns (positions, (width, height))
-    with positions normalized to a tight box anchored at (0, 0)."""
+    with positions normalized to a tight box anchored at (0, 0).
+
+    `zone_size` (w, h) fits the layout into a user-drawn box: its actual
+    dimensions become the wrap/band caps instead of area estimates."""
     if not items:
         return {}, (0.0, 0.0)
     layer, preds, succs, islands = _assign_layers(items, edges)
     ordered_layers = _order_layers(items, layer, preds, succs, edges, sweeps)
+
+    bands = None
+    band_gap = 2.0 * max(h_spacing, v_spacing)
+    if (shape_ratio or zone_size) and ordered_layers:
+        if zone_size:
+            zone_w, zone_h = zone_size
+            if direction == "top_to_bottom":
+                breadth_cap, flow_cap = zone_w, zone_h
+            else:
+                breadth_cap, flow_cap = zone_h, zone_w
+        else:
+            linked_ids = [iid for col in ordered_layers for iid in col]
+            breadth_cap, flow_cap = _shape_targets(items, linked_ids,
+                                                   shape_ratio, direction)
+        dim = "w" if direction == "top_to_bottom" else "h"
+        breadth0 = max(
+            sum(items[i][dim] for i in col) + v_spacing * (len(col) - 1)
+            for col in ordered_layers
+        )
+        if breadth0 > breadth_cap * SHAPE_SLACK:
+            # Too tall for the shape: cap the breadth; the flow extent
+            # then lands near the target on its own (area is conserved).
+            biggest = max(items[i][dim] for i in items)
+            wrap_breadth = max(breadth_cap, biggest + 1.0)
+        else:
+            # Not tall — maybe too long: fold the layer sequence.
+            bands = _partition_bands(
+                items, ordered_layers, direction, h_spacing, v_spacing,
+                band_gap, shape_ratio,
+                flow_cap if zone_size else None)
+            if len(bands) == 1:
+                bands = None
+
     ordered_layers = _wrap_layers(items, ordered_layers, direction,
                                   v_spacing, wrap_breadth)
-    positions, main_extent = _place_layers(
-        items, ordered_layers, direction, h_spacing, v_spacing, align
-    )
-    positions.update(_place_islands(items, islands, main_extent, h_spacing, v_spacing))
+
+    if bands is None:
+        positions, main_extent = _place_layers(
+            items, ordered_layers, direction, h_spacing, v_spacing, align
+        )
+    else:
+        # Serpentine: each band is placed independently (so alignment
+        # centers within its own band) and offset along the breadth axis
+        # by the previous bands' measured extent.
+        positions = {}
+        cursor = 0.0
+        flow_extent = 0.0
+        for band in bands:
+            band_pos, (bw, bh) = _place_layers(
+                items, band, direction, h_spacing, v_spacing, align
+            )
+            if direction == "top_to_bottom":
+                for iid, p in band_pos.items():
+                    positions[iid] = [p[0] + cursor, p[1]]
+                cursor += bw + band_gap
+                flow_extent = max(flow_extent, bh)
+            else:
+                for iid, p in band_pos.items():
+                    positions[iid] = [p[0], p[1] + cursor]
+                cursor += bh + band_gap
+                flow_extent = max(flow_extent, bw)
+        breadth_extent = cursor - band_gap
+        main_extent = ((breadth_extent, flow_extent)
+                       if direction == "top_to_bottom"
+                       else (flow_extent, breadth_extent))
+    positions.update(_place_islands(items, islands, main_extent, h_spacing,
+                                    v_spacing, shape_ratio))
 
     min_x = min(p[0] for p in positions.values())
     min_y = min(p[1] for p in positions.values())
@@ -554,7 +733,8 @@ def _build_hierarchy(nodes, groups, extra_clusters=None, synthetic_start=0):
 
 def _cluster_layout(nodes, edges, groups, direction, h_spacing, v_spacing,
                     sweeps, extra_clusters=None, synthetic_start=0,
-                    wrap_breadth=0, align="top"):
+                    wrap_breadth=0, align="top", shape_ratio=None,
+                    zone_size=None):
     """Recursive compound layout: every group (nested ones included) is laid
     out as its own cluster, then each container arranges its direct child
     clusters and loose nodes with the same layered algorithm. Sibling frames
@@ -613,7 +793,10 @@ def _cluster_layout(nodes, edges, groups, direction, h_spacing, v_spacing,
 
         positions, (width, height) = _layered_layout(
             items, container_edges, direction, h_spacing, v_spacing, sweeps,
-            wrap_breadth, align,
+            wrap_breadth, align, shape_ratio,
+            # A drawn zone bounds the overall canvas; interiors follow
+            # its RATIO only (their own size is theirs to determine).
+            zone_size if container is None else None,
         )
         layouts[container] = positions
         if container is not None:
@@ -645,7 +828,8 @@ def _cluster_layout(nodes, edges, groups, direction, h_spacing, v_spacing,
 
 
 def _inner_group_layout(nodes, edges, groups, direction, h_spacing,
-                        v_spacing, sweeps, wrap_breadth, align):
+                        v_spacing, sweeps, wrap_breadth, align,
+                        shape_ratio=None):
     """group_mode="inner": preserve the user's macro arrangement.
 
     Each top-level group keeps its current top-left corner; only its
@@ -675,7 +859,7 @@ def _inner_group_layout(nodes, edges, groups, direction, h_spacing,
         sub_groups = [by_index[gindex] for gindex in sorted(subtree)]
         rel_positions, rel_updates = _cluster_layout(
             members, sub_edges, sub_groups, direction, h_spacing,
-            v_spacing, sweeps, None, 0, wrap_breadth, align,
+            v_spacing, sweeps, None, 0, wrap_breadth, align, shape_ratio,
         )
         anchor = by_index[root_index]
         root_frame = next(
@@ -942,6 +1126,16 @@ def compute_layout(workflow, options=None, extra_clusters=None):
     wrap_breadth = max(0.0, _finite(opts.get("wrap_breadth", 2600), 2600))
     align = "top" if str(opts.get("align") or "center") == "top" else "center"
     snap = max(0.0, _finite(opts.get("snap_grid", 10), 10))
+    shape_ratio = SHAPE_RATIOS.get(str(opts.get("shape") or "auto").lower())
+    zone_size = None
+    raw_zone = opts.get("zone_size")
+    if isinstance(raw_zone, (list, tuple)) and len(raw_zone) >= 2:
+        zone_w = _finite(raw_zone[0], 0.0)
+        zone_h = _finite(raw_zone[1], 0.0)
+        if zone_w > 0 and zone_h > 0:
+            zone_size = (zone_w, zone_h)
+            # The drawn box's own proportions drive every level.
+            shape_ratio = max(0.2, min(5.0, zone_w / zone_h))
 
     nodes = _normalize_nodes(workflow)
     if not nodes:
@@ -956,17 +1150,18 @@ def compute_layout(workflow, options=None, extra_clusters=None):
     if group_mode == "inner":  # no groups -> nothing to sort inside
         positions, group_updates = _inner_group_layout(
             nodes, edges, groups, direction, h_spacing, v_spacing, sweeps,
-            wrap_breadth, align,
+            wrap_breadth, align, shape_ratio,
         )
     elif group_mode == "cluster" and (groups or extra_clusters):
         positions, group_updates = _cluster_layout(
             nodes, edges, groups, direction, h_spacing, v_spacing, sweeps,
             extra_clusters, synthetic_start, wrap_breadth, align,
+            shape_ratio, zone_size,
         )
     else:
         positions, _extent = _layered_layout(
             nodes, edges, direction, h_spacing, v_spacing, sweeps,
-            wrap_breadth, align,
+            wrap_breadth, align, shape_ratio, zone_size,
         )
         group_updates = _refit_member_groups(groups, nodes, positions)
 

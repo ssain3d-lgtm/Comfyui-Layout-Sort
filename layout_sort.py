@@ -24,6 +24,7 @@ import os
 import tempfile
 
 from .layout_core import (
+    TITLE_HEIGHT,
     _center,
     _group_contains,
     _normalize_groups,
@@ -190,6 +191,28 @@ def _scoped_workflow(workflow, scope_ids):
     return scoped, index_map
 
 
+def _drop_empty_group(workflow, index):
+    """Remove group `index` when it is verifiably EMPTY (a drawn zone).
+
+    Returns (workflow_copy, index_map new->old) or (workflow, None) when
+    the group has members or the index is invalid — a populated group is
+    content, never a zone specification."""
+    raw_groups = workflow.get("groups") or []
+    if not isinstance(index, int) or not (0 <= index < len(raw_groups)):
+        return workflow, None
+    target = next((g for g in _normalize_groups(workflow)
+                   if g["index"] == index), None)
+    if target is None:
+        return workflow, None
+    nodes = _normalize_nodes(workflow)
+    if any(_group_contains(target, *_center(n)) for n in nodes.values()):
+        return workflow, None
+    out = dict(workflow)
+    out["groups"] = [g for i, g in enumerate(raw_groups) if i != index]
+    survivors = [i for i in range(len(raw_groups)) if i != index]
+    return out, {new: old for new, old in enumerate(survivors)}
+
+
 def run_layout(workflow, options, llm_cfg=None, progress=None):
     """Shared pipeline for the node and the HTTP route.
 
@@ -230,10 +253,37 @@ def run_layout(workflow, options, llm_cfg=None, progress=None):
         )
     options = dict(options or {})
     full_group_count = len(workflow.get("groups") or [])
-    scope_ids = options.pop("scope_ids", None)
+    group_mode = str(options.get("group_mode") or "cluster")
+
+    # A selected EMPTY group frame acts as a drawn zone: the layout is
+    # shaped to its proportions and placed at its corner. The zone frame
+    # itself is dropped from the compute copy (it is the specification,
+    # not content) and stays exactly where the user drew it.
+    zone_rect = None
+    raw_zone = options.pop("zone", None)
+    zone_index = options.pop("zone_index", None)
     group_index_map = None
+    if (group_mode != "inner"
+            and isinstance(raw_zone, (list, tuple)) and len(raw_zone) >= 4):
+        try:
+            candidate = [float(v) for v in raw_zone[:4]]
+        except (TypeError, ValueError):
+            candidate = None
+        if candidate and candidate[2] > 0 and candidate[3] > 0:
+            workflow, group_index_map = _drop_empty_group(workflow,
+                                                          zone_index)
+            if group_index_map is not None:
+                zone_rect = candidate
+                options["zone_size"] = [candidate[2], candidate[3]]
+
+    scope_ids = options.pop("scope_ids", None)
     if scope_ids:
-        workflow, group_index_map = _scoped_workflow(workflow, scope_ids)
+        workflow, scope_map = _scoped_workflow(workflow, scope_ids)
+        if group_index_map is None:
+            group_index_map = scope_map
+        else:
+            group_index_map = {new: group_index_map[mid]
+                               for new, mid in scope_map.items()}
     extra_clusters = None
     llm_info = None
     prompt = str((llm_cfg or {}).get("prompt") or "").strip()
@@ -282,13 +332,39 @@ def run_layout(workflow, options, llm_cfg=None, progress=None):
     notify("layout")
     result = compute_layout(workflow, options, extra_clusters)
     if group_index_map is not None:
-        # Scoped copies renumber groups from 0; translate frame updates
+        # Filtered copies renumber groups from 0; translate frame updates
         # back to the live graph's group indices.
         result["groups"] = [
             {**u, "index": group_index_map[u["index"]]}
             for u in result.get("groups") or []
             if u["index"] in group_index_map
         ]
+    if (zone_rect is not None and result.get("positions")
+            and (options.get("group_mode") or "cluster") != "inner"):
+        # Land the reshaped content at the drawn box's corner (snapped so
+        # the grid alignment survives). Sizes are never scaled: content
+        # larger than the box overflows right/down at the box's ratio.
+        min_x = min(
+            [p[0] for p in result["positions"].values()]
+            + [u["bounding"][0] for u in result.get("groups") or []]
+            + [g["bounding"][0] for g in result.get("new_groups") or []])
+        min_y = min(
+            [p[1] - TITLE_HEIGHT for p in result["positions"].values()]
+            + [u["bounding"][1] for u in result.get("groups") or []]
+            + [g["bounding"][1] for g in result.get("new_groups") or []])
+        dx = round((zone_rect[0] - min_x) / 10.0) * 10.0
+        dy = round((zone_rect[1] - min_y) / 10.0) * 10.0
+        if dx or dy:
+            for p in result["positions"].values():
+                p[0] += dx
+                p[1] += dy
+            for u in (result.get("groups") or []) + (result.get("new_groups")
+                                                     or []):
+                u["bounding"][0] += dx
+                u["bounding"][1] += dy
+            for p in (result.get("reroutes") or {}).values():
+                p[0] += dx
+                p[1] += dy
     # Frame updates are index-based; the frontend compares this against
     # the live graph so frames added/removed during a slow LLM round-trip
     # can never receive another frame's geometry.
@@ -506,6 +582,18 @@ class LayoutSort:
                                 "columns snapped to the canvas grid. Node "
                                 "sizes are never changed."},
                 ),
+                "shape": (
+                    ["auto", "square", "wide", "tall"],
+                    {"default": "auto",
+                     "tooltip": "Target canvas proportions. square = 1:1, "
+                                "wide = 2:1, tall = 1:2 — long pipelines "
+                                "fold into serpentine bands, tall graphs "
+                                "spread into extra columns; group interiors "
+                                "follow the same ratio. auto keeps the "
+                                "natural flow. Tip: select an EMPTY group "
+                                "frame before sorting to fit the layout "
+                                "into that drawn box instead."},
+                ),
                 "animate": ("BOOLEAN", {"default": True}),
                 "llm_prompt": (
                     "STRING",
@@ -581,8 +669,9 @@ class LayoutSort:
         return True
 
     def sort(self, direction, layer_spacing, node_spacing, group_mode, style,
-             animate, llm_prompt, llm_provider, llm_base_url, llm_model,
-             llm_max_tokens, trigger=None, extra_pnginfo=None, unique_id=None):
+             shape, animate, llm_prompt, llm_provider, llm_base_url,
+             llm_model, llm_max_tokens, trigger=None, extra_pnginfo=None,
+             unique_id=None):
         workflow = (extra_pnginfo or {}).get("workflow")
         server = getattr(PromptServer, "instance", None) if PromptServer else None
         if not workflow or server is None:
@@ -595,6 +684,7 @@ class LayoutSort:
                 "v_spacing": node_spacing,
                 "group_mode": group_mode,
                 "style": style,
+                "shape": shape,
             },
             {
                 "prompt": llm_prompt,

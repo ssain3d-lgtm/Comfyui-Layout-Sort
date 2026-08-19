@@ -215,6 +215,32 @@ def case_clusters():
     assert res["llm"]["clusters"] == 2
 
 
+@case("shape: plan square reshapes a wide chain toward 1:1")
+def case_shape_square():
+    chain = {
+        "nodes": [{"id": i, "type": "N", "pos": [i * 400, 0],
+                   "size": [300, 120], "flags": {}}
+                  for i in range(1, 19)],
+        "links": [[i, i, 0, i + 1, 0, "X"] for i in range(1, 18)],
+    }
+
+    def ratio(res):
+        xs, ys = [], []
+        for n in chain["nodes"]:
+            p = res["positions"][str(n["id"])]
+            xs += [p[0], p[0] + n["size"][0]]
+            ys += [p[1] - TITLE_HEIGHT, p[1] + n["size"][1]]
+        return (max(xs) - min(xs)) / (max(ys) - min(ys))
+
+    res, _wf = run_plan({"options": {"shape": "square"}, "note": "정사각형"},
+                        wf=json.loads(json.dumps(chain)))
+    assert res["llm"]["applied"] == {"shape": "square"}
+    auto = layout_sort.run_layout(json.loads(json.dumps(chain)), {})
+    assert abs(ratio(res) - 1.0) < abs(ratio(auto) - 1.0), \
+        f"square plan must move ratio toward 1: {ratio(auto):.2f} -> " \
+        f"{ratio(res):.2f}"
+
+
 @case("everything combined in one plan: all directives hold at once")
 def case_combined():
     res, wf = run_plan({

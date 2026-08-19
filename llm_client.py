@@ -50,6 +50,7 @@ PLAN_ENUMS = {
     "direction": ("left_to_right", "top_to_bottom"),
     "group_mode": ("cluster", "inner", "refit"),
     "style": ("flow", "grid"),
+    "shape": ("auto", "square", "wide", "tall"),
 }
 PLAN_SPACING_KEYS = ("h_spacing", "v_spacing")
 SPACING_MIN, SPACING_MAX = 10, 600
@@ -72,6 +73,9 @@ SYSTEM_PROMPT = (
     'put it and only tidy the nodes inside), "refit" (ignore frames while '
     "sorting, re-wrap them afterwards; only for lightly grouped graphs)\n"
     '- "style": "flow" (centered columns) or "grid" (top-aligned columns)\n'
+    '- "shape": "square" (1:1 canvas), "wide" (2:1), "tall" (1:2) or '
+    '"auto" — long pipelines fold into bands, tall graphs spread into '
+    "extra columns, group interiors follow the same ratio\n"
     "Additionally, \"clusters\" may group UNGROUPED nodes into named "
     'frames: [{"name": "Model loading", "node_ids": [1, 2]}]. Use only '
     "ids from the UNGROUPED list; each node in at most one cluster; only "
@@ -116,6 +120,10 @@ RESPONSE_SCHEMA = {
                         "style": {
                             "type": "string",
                             "enum": list(PLAN_ENUMS["style"]),
+                        },
+                        "shape": {
+                            "type": "string",
+                            "enum": list(PLAN_ENUMS["shape"]),
                         },
                     },
                 },
@@ -242,7 +250,7 @@ def build_digest(workflow, current_options=None):
     if current_options:
         shown = []
         for key in ("direction", "h_spacing", "v_spacing", "group_mode",
-                    "style"):
+                    "style", "shape"):
             value = current_options.get(key)
             if value is not None:
                 shown.append(f"{key}={value}")

@@ -481,4 +481,69 @@ for idem_mode in ("cluster", "inner"):
     b2 = {u["index"]: u["bounding"] for u in runs[2]["groups"]}
     assert b1 == b2, f"{idem_mode}: frames drifted {b1} -> {b2}"
 print("idempotent re-sort OK")
+
+# ------------------------------------------------ shape: square/wide/tall
+def shape_chain(n):
+    return {
+        "nodes": [node(i, "N", [i * 400, 0], [300, 120])
+                  for i in range(1, n + 1)],
+        "links": [[i, i, 0, i + 1, 0, "X"] for i in range(1, n)],
+    }
+
+
+def shape_extent(res, wf):
+    xs, ys = [], []
+    for n in wf["nodes"]:
+        p = res["positions"][str(n["id"])]
+        xs += [p[0], p[0] + n["size"][0]]
+        ys += [p[1] - TITLE_HEIGHT, p[1] + n["size"][1]]
+    return max(xs) - min(xs), max(ys) - min(ys)
+
+
+def no_overlaps(res, wf):
+    rects = []
+    for n in wf["nodes"]:
+        p = res["positions"][str(n["id"])]
+        rects.append((p[0], p[1] - TITLE_HEIGHT,
+                      n["size"][0], n["size"][1] + TITLE_HEIGHT))
+    for i in range(len(rects)):
+        for j in range(i + 1, len(rects)):
+            assert not rects_overlap(rects[i], rects[j]), \
+                f"shape overlap {rects[i]} vs {rects[j]}"
+
+
+auto_w, auto_h = shape_extent(compute_layout(shape_chain(24), {}),
+                              shape_chain(24))
+assert auto_w / auto_h > 10, "chain fixture should be extremely wide"
+for shape_name, lo, hi in (("square", 0.5, 2.0), ("wide", 1.0, 3.5),
+                           ("tall", 0.2, 1.0)):
+    res = compute_layout(shape_chain(24), {"shape": shape_name})
+    w, h = shape_extent(res, shape_chain(24))
+    assert lo <= w / h <= hi, f"{shape_name}: ratio {w / h:.2f} not in " \
+        f"[{lo}, {hi}]"
+    no_overlaps(res, shape_chain(24))
+    assert set(res["positions"]) == {str(i) for i in range(1, 25)}
+
+# a bushy (tall) graph widens via breadth capping instead of banding
+bushy = {"nodes": [node(1, "S", [0, 0], [200, 100])], "links": []}
+for i in range(2, 22):
+    bushy["nodes"].append(node(i, "B", [400, i * 200], [250, 150]))
+    bushy["links"].append([i, 1, 0, i, 0, "X"])
+res_a = compute_layout({"nodes": [dict(n) for n in bushy["nodes"]],
+                        "links": [list(l) for l in bushy["links"]]}, {})
+res_s = compute_layout(bushy, {"shape": "square"})
+wa, ha = shape_extent(res_a, bushy)
+ws, hs = shape_extent(res_s, bushy)
+assert abs(ws / hs - 1.0) < abs(wa / ha - 1.0), \
+    f"square must move the ratio toward 1: {wa / ha:.2f} -> {ws / hs:.2f}"
+no_overlaps(res_s, bushy)
+
+# zone_size: the drawn box's dimensions become the actual caps
+zone_res = compute_layout(shape_chain(24),
+                          {"zone_size": [2000, 1500], "snap_grid": 10})
+zw, zh = shape_extent(zone_res, shape_chain(24))
+assert zw <= 2000 * 1.3 and zh <= 1500 * 1.6, \
+    f"zone fit exceeded the box badly: {zw:.0f}x{zh:.0f} vs 2000x1500"
+no_overlaps(zone_res, shape_chain(24))
+print("shape + zone OK")
 print("ALL CHECKS PASSED")

@@ -88,6 +88,41 @@ def main():
     assert res["positions"] == {} and res["groups"] == []
     print("unknown ids OK")
 
+    # --- drawn zone: an EMPTY group frame shapes and places the layout
+    wf = two_group_workflow()
+    wf["groups"].append({"title": "Zone", "bounding": [5000, 7000,
+                                                       2400, 1600]})
+    res = layout_sort.run_layout(wf, {"zone": [5000, 7000, 2400, 1600],
+                                      "zone_index": 2})
+    # content lands at the drawn corner (snap tolerance)
+    nodes = node_map(wf)
+    min_x = min(min(p[0] for p in res["positions"].values()),
+                min(u["bounding"][0] for u in res["groups"]))
+    min_y = min(min(p[1] - TITLE_HEIGHT
+                    for p in res["positions"].values()),
+                min(u["bounding"][1] for u in res["groups"]))
+    assert abs(min_x - 5000) <= 10 and abs(min_y - 7000) <= 10, \
+        f"zone corner missed: ({min_x}, {min_y})"
+    # the zone frame itself is never updated; real groups keep their
+    # ORIGINAL indices (0 and 1) despite the zone being dropped mid-way
+    touched = {u["index"] for u in res["groups"]}
+    assert 2 not in touched and touched <= {0, 1}, res["groups"]
+    assert res["group_count"] == 3, "staleness token counts the zone too"
+    for nid in (8, 9):  # IO group members stay inside their frame
+        bounding = next(u["bounding"] for u in res["groups"]
+                        if u["index"] == 1)
+        assert rect_inside(visual_rect(nodes[nid],
+                                       res["positions"][str(nid)]), bounding)
+    print("zone fit OK")
+
+    # --- a POPULATED group offered as a zone is refused (it is content)
+    wf = two_group_workflow()
+    res = layout_sort.run_layout(wf, {"zone": [50, 100, 500, 500],
+                                      "zone_index": 0})
+    assert {u["index"] for u in res["groups"]} == {0, 1}, \
+        "populated zone candidate must sort normally"
+    print("populated zone refused OK")
+
     print("ALL SCOPED-SORT TESTS PASSED")
 
 

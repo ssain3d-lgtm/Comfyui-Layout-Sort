@@ -218,20 +218,50 @@ function selectedNodes() {
     return [...found.values()];
 }
 
+function selectedGroups() {
+    const found = [];
+    app.canvas?.selectedItems?.forEach?.((item) => {
+        if (isGroupItem(item)) found.push(item);
+    });
+    const legacy = app.canvas?.selected_group;
+    if (legacy && isGroupItem(legacy) && !found.includes(legacy)) {
+        found.push(legacy);
+    }
+    return found;
+}
+
+function groupMembers(group) {
+    try {
+        group.recomputeInsideNodes();
+    } catch (err) { /* membership stays as last computed */ }
+    return group._nodes ?? group.nodes ?? [];
+}
+
 function selectionScope() {
     // Node ids the sort should be limited to: every selected node plus
     // the members of every selected group frame.
     const ids = new Set(selectedNodes().map((n) => n.id));
-    app.canvas?.selectedItems?.forEach?.((item) => {
-        if (!isGroupItem(item)) return;
-        try {
-            item.recomputeInsideNodes();
-        } catch (err) { /* membership stays as last computed */ }
-        for (const n of item._nodes ?? item.nodes ?? []) {
+    for (const group of selectedGroups()) {
+        for (const n of groupMembers(group)) {
             if (n?.id != null) ids.add(n.id);
         }
-    });
+    }
     return [...ids];
+}
+
+function selectedZone() {
+    // A selected EMPTY group frame is a drawn target zone: the sort
+    // shapes the layout to its proportions and lands it at its corner.
+    for (const group of selectedGroups()) {
+        if (groupMembers(group).length) continue;
+        const index = graphGroups().indexOf(group);
+        if (index >= 0) {
+            return { rect: [group.pos[0], group.pos[1],
+                            group.size[0], group.size[1]],
+                     index };
+        }
+    }
+    return null;
 }
 
 // --- pure geometry for the align/distribute tools (extracted by tests) ---
@@ -396,11 +426,18 @@ async function sortNow(node) {
         v_spacing: widgetValue(node, "node_spacing", 40),
         group_mode: widgetValue(node, "group_mode", "cluster"),
         style: widgetValue(node, "style", "flow"),
+        shape: widgetValue(node, "shape", "auto"),
     };
     // 2+ selected nodes (or selected group frames) = sort only those,
     // anchored where the selection sits; everything else stays put.
     const scope = selectionScope();
     if (scope.length >= 2) options.scope_ids = scope;
+    // A selected EMPTY group frame = drawn zone to fit the layout into.
+    const zone = selectedZone();
+    if (zone) {
+        options.zone = zone.rect;
+        options.zone_index = zone.index;
+    }
     // The API key is deliberately absent here: it lives server-side only
     // (key dialog / env var) and must never enter the graph or this payload.
     const llm = {
@@ -430,6 +467,9 @@ async function sortNow(node) {
         if (options.scope_ids) {
             const moved = Object.keys(result.positions ?? {}).length;
             toolToast(`Sorted ${moved} selected node(s); the rest stayed put.`);
+        }
+        if (options.zone) {
+            toolToast("Arranged into the drawn zone (frame kept as is).");
         }
     } catch (err) {
         console.error("[LayoutSort] sort request failed:", err);
@@ -571,6 +611,7 @@ const COMBO_VALUES = {
     direction: ["left_to_right", "top_to_bottom"],
     group_mode: ["cluster", "inner", "refit"],
     style: ["flow", "grid"],
+    shape: ["auto", "square", "wide", "tall"],
     llm_provider: ["lmstudio", "ollama", "openai", "anthropic", "custom"],
 };
 
@@ -590,6 +631,11 @@ function sanitizeWidgets(node) {
         } else {
             widget.value = values[0];
         }
+    }
+    const animateWidget = get("animate");
+    if (animateWidget && typeof animateWidget.value !== "boolean") {
+        // Saves predating the shape widget leave a shifted value here.
+        animateWidget.value = true;
     }
     const promptWidget = get("llm_prompt");
     if (promptWidget) {
