@@ -460,6 +460,16 @@ async function sortNow(node) {
         options.zone = zone.rect;
         options.zone_index = zone.index;
     }
+    // Selected POPULATED group frames sort in place: members re-arrange
+    // inside the frame, the frame itself keeps its exact size/position.
+    const frames = [];
+    for (const group of selectedGroups()) {
+        const members = groupMembers(group);
+        if (!members.length) continue;
+        frames.push({ rect: groupRect(group), title: group.title,
+                      ids: members.map((n) => n.id) });
+    }
+    if (frames.length) options.frames = frames;
     // The API key is deliberately absent here: it lives server-side only
     // (key dialog / env var) and must never enter the graph or this payload.
     const llm = {
@@ -486,7 +496,15 @@ async function sortNow(node) {
             animate: widgetValue(node, "animate", true),
             group_count: result.group_count,
         });
-        if (options.scope_ids) {
+        if (options.frames) {
+            toolToast(`Tidied ${options.frames.length} group frame(s) in `
+                + "place (size unchanged).");
+            if (result.frames?.overflow?.length) {
+                toolToast("Content overflows: "
+                    + `${result.frames.overflow.join(", ")} — enlarge the `
+                    + "frame or reduce spacing.", "warn");
+            }
+        } else if (options.scope_ids) {
             const moved = Object.keys(result.positions ?? {}).length;
             toolToast(`Sorted ${moved} selected node(s); the rest stayed put.`);
         }

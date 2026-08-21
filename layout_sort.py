@@ -24,6 +24,8 @@ import os
 import tempfile
 
 from .layout_core import (
+    GROUP_SIDE_PADDING,
+    GROUP_TITLE_PADDING,
     TITLE_HEIGHT,
     _center,
     _group_contains,
@@ -194,6 +196,126 @@ def _scoped_workflow(workflow, scope_ids):
 ZONE_MATCH_TOLERANCE = 3.0
 
 
+def _shift_result(positions, group_updates, reroutes, target_x, target_y):
+    """Translate a compute result so its visual top-left lands on the
+    target point (snapped delta, so grid alignment survives). Mutates in
+    place; returns (dx, dy)."""
+    if not positions and not group_updates:
+        return 0.0, 0.0
+    min_x = min([p[0] for p in positions.values()]
+                + [u["bounding"][0] for u in group_updates])
+    min_y = min([p[1] - TITLE_HEIGHT for p in positions.values()]
+                + [u["bounding"][1] for u in group_updates])
+    dx = round((target_x - min_x) / 10.0) * 10.0
+    dy = round((target_y - min_y) / 10.0) * 10.0
+    if dx or dy:
+        for p in positions.values():
+            p[0] += dx
+            p[1] += dy
+        for u in group_updates:
+            u["bounding"][0] += dx
+            u["bounding"][1] += dy
+        for p in (reroutes or {}).values():
+            p[0] += dx
+            p[1] += dy
+    return dx, dy
+
+
+def _fit_frame_sorts(workflow, frames, options):
+    """Sort each selected populated group INSIDE its own frame.
+
+    The frame is the user's decision, so it is never moved or resized:
+    its interior (minus the title/side padding) becomes the target box —
+    members re-arrange to its proportions and land at its corner. Nested
+    child frames still refit around their content. Content larger than
+    the frame overflows right/down and is reported.
+
+    Returns (positions, group_updates with live indices, reroutes,
+    overflow_frame_titles)."""
+    positions, updates, reroutes, overflow = {}, [], {}, []
+    raw_groups = workflow.get("groups") or []
+    for frame in frames:
+        rect = frame["rect"]
+        scoped, index_map = _scoped_workflow(workflow, frame["ids"])
+        # Drop the outer frame itself from the copy (matched by rect):
+        # it must be neither refit nor parked.
+        inner_groups, chain = [], {}
+        for scoped_idx, live_idx in sorted(index_map.items()):
+            bounding = _normalize_groups({"groups":
+                                          [raw_groups[live_idx]]})[0]
+            if (abs(bounding["x"] - rect[0]) <= ZONE_MATCH_TOLERANCE
+                    and abs(bounding["y"] - rect[1]) <= ZONE_MATCH_TOLERANCE
+                    and abs(bounding["w"] - rect[2]) <= ZONE_MATCH_TOLERANCE
+                    and abs(bounding["h"] - rect[3]) <= ZONE_MATCH_TOLERANCE):
+                continue
+            chain[len(inner_groups)] = live_idx
+            inner_groups.append(scoped["groups"][scoped_idx])
+        scoped = dict(scoped)
+        scoped["groups"] = inner_groups
+
+        interior_w = max(rect[2] - GROUP_SIDE_PADDING * 2.0, 100.0)
+        interior_h = max(rect[3] - GROUP_TITLE_PADDING - GROUP_SIDE_PADDING,
+                         100.0)
+        opts = dict(options)
+        opts["zone_size"] = [interior_w, interior_h]
+        result = compute_layout(scoped, opts)
+
+        frame_updates = [
+            {**u, "index": chain[u["index"]]}
+            for u in result.get("groups") or []
+            if u["index"] in chain
+        ]
+        _shift_result(result["positions"], frame_updates,
+                      result.get("reroutes") or {},
+                      rect[0] + GROUP_SIDE_PADDING,
+                      rect[1] + GROUP_TITLE_PADDING)
+        nodes = _normalize_nodes(scoped)
+        content_w = max(
+            [p[0] + nodes[_nid_key(nodes, k)]["w"] - rect[0]
+             for k, p in result["positions"].items()] or [0.0])
+        content_h = max(
+            [p[1] - TITLE_HEIGHT + nodes[_nid_key(nodes, k)]["h"] - rect[1]
+             for k, p in result["positions"].items()] or [0.0])
+        if (content_w > rect[2] + 1.0 or content_h > rect[3] + 1.0):
+            overflow.append(str(frame.get("title") or "group"))
+        positions.update(result["positions"])
+        updates.extend(frame_updates)
+        reroutes.update(result.get("reroutes") or {})
+    return positions, updates, reroutes, overflow
+
+
+def _nid_key(nodes, key):
+    """Map a stringified position key back onto the normalized-nodes key."""
+    if key in nodes:
+        return key
+    try:
+        as_int = int(key)
+    except (TypeError, ValueError):
+        return key
+    return as_int if as_int in nodes else key
+
+
+def _validated_frames(raw):
+    frames = []
+    for entry in raw or []:
+        if not isinstance(entry, dict):
+            continue
+        rect = entry.get("rect")
+        ids = entry.get("ids")
+        if not (isinstance(rect, (list, tuple)) and len(rect) >= 4
+                and isinstance(ids, list) and ids):
+            continue
+        try:
+            rect = [float(v) for v in rect[:4]]
+        except (TypeError, ValueError):
+            continue
+        if rect[2] <= 0 or rect[3] <= 0:
+            continue
+        frames.append({"rect": rect, "ids": list(ids),
+                       "title": entry.get("title")})
+    return frames
+
+
 def _resolve_zone_group(workflow, rect, index_hint):
     """Index of the EMPTY group frame matching the drawn rect.
 
@@ -330,7 +452,19 @@ def run_layout(workflow, options, llm_cfg=None, progress=None):
                 options["zone_size"] = [candidate[2], candidate[3]]
                 zone_status = {"applied": True, "reason": None}
 
+    # Selected POPULATED group frames sort in place: their members are
+    # fitted into the frame's own interior and the frame is never moved
+    # or resized (it is the user's decision). Their ids leave the normal
+    # scoped batch so nothing is laid out twice.
+    frames = _validated_frames(options.pop("frames", None))
+    frames_workflow = workflow
     scope_ids = options.pop("scope_ids", None)
+    run_main = True
+    if frames and scope_ids:
+        frame_ids = {str(i) for f in frames for i in f["ids"]}
+        scope_ids = [i for i in scope_ids if str(i) not in frame_ids]
+        if not scope_ids:
+            run_main = False  # pure frame job: nothing else may move
     if scope_ids:
         workflow, scope_map = _scoped_workflow(workflow, scope_ids)
         if group_index_map is None:
@@ -384,7 +518,11 @@ def run_layout(workflow, options, llm_cfg=None, progress=None):
         options = {**style,
                    **{k: v for k, v in options.items() if v is not None}}
     notify("layout")
-    result = compute_layout(workflow, options, extra_clusters)
+    if run_main:
+        result = compute_layout(workflow, options, extra_clusters)
+    else:
+        result = {"positions": {}, "groups": [], "new_groups": [],
+                  "reroutes": {}}
     if group_index_map is not None:
         # Filtered copies renumber groups from 0; translate frame updates
         # back to the live graph's group indices.
@@ -431,6 +569,20 @@ def run_layout(workflow, options, llm_cfg=None, progress=None):
                 p[1] += dy
     if zone_status is not None:
         result["zone"] = zone_status
+    if frames:
+        # Interiors are compound content: cluster is the mode that lays
+        # them out inside a fixed box (inner would be a no-op for the
+        # mostly-ungrouped members, refit would scatter them).
+        fit_options = {k: v for k, v in options.items()
+                       if k != "zone_size"}
+        fit_options["group_mode"] = "cluster"
+        f_positions, f_updates, f_reroutes, f_overflow = _fit_frame_sorts(
+            frames_workflow, frames, fit_options)
+        result["positions"].update(f_positions)
+        result["groups"] = (result.get("groups") or []) + f_updates
+        result["reroutes"] = {**(result.get("reroutes") or {}),
+                              **f_reroutes}
+        result["frames"] = {"count": len(frames), "overflow": f_overflow}
     # Frame updates are index-based; the frontend compares this against
     # the live graph so frames added/removed during a slow LLM round-trip
     # can never receive another frame's geometry.

@@ -146,6 +146,52 @@ def main():
         and "matches" in res["zone"]["reason"], res["zone"]
     print("unmatched zone reported OK")
 
+    # --- fixed-frame sort: a selected POPULATED group keeps its exact
+    # frame; only its members re-arrange inside it
+    wf = make_workflow()
+    wf["groups"] = [{"title": "Roomy",
+                     "bounding": [40, 100, 900, 700]}]  # holds 4 and 10
+    res = layout_sort.run_layout(
+        wf, {"scope_ids": [4, 10],
+             "frames": [{"rect": [40, 100, 900, 700], "title": "Roomy",
+                         "ids": [4, 10]}]})
+    assert res["groups"] == [], \
+        f"the selected frame must never be updated: {res['groups']}"
+    assert set(res["positions"]) == {"4", "10"}
+    nodes = node_map(wf)
+    for nid in (4, 10):
+        assert rect_inside(visual_rect(nodes[nid],
+                                       res["positions"][str(nid)]),
+                           [40, 100, 900, 700]), \
+            f"member {nid} left the fixed frame"
+    assert res["frames"] == {"count": 1, "overflow": []}, res.get("frames")
+    print("fixed frame OK")
+
+    # --- too-small frame: sorted anyway, overflow reported honestly
+    wf = make_workflow()
+    wf["groups"] = [{"title": "Tiny", "bounding": [40, 100, 400, 200]}]
+    res = layout_sort.run_layout(
+        wf, {"scope_ids": [4, 10],
+             "frames": [{"rect": [40, 100, 400, 200], "title": "Tiny",
+                         "ids": [4, 10]}]})
+    assert res["groups"] == [] and set(res["positions"]) == {"4", "10"}
+    assert res["frames"]["overflow"] == ["Tiny"], res["frames"]
+    # anchored at the frame's padded corner even when overflowing
+    min_x = min(p[0] for p in res["positions"].values())
+    assert abs(min_x - (40 + 24)) <= 10, min_x
+    print("frame overflow OK")
+
+    # --- mixed selection: frame fixed, extra loose node sorts separately
+    wf = make_workflow()
+    wf["groups"] = [{"title": "Roomy", "bounding": [40, 100, 900, 700]}]
+    res = layout_sort.run_layout(
+        wf, {"scope_ids": [4, 10, 9],
+             "frames": [{"rect": [40, 100, 900, 700], "title": "Roomy",
+                         "ids": [4, 10]}]})
+    assert set(res["positions"]) == {"4", "10", "9"}
+    assert res["groups"] == [], res["groups"]
+    print("mixed frame + loose OK")
+
     print("ALL SCOPED-SORT TESTS PASSED")
 
 
