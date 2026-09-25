@@ -546,4 +546,31 @@ assert zw <= 2000 * 1.3 and zh <= 1500 * 1.6, \
     f"zone fit exceeded the box badly: {zw:.0f}x{zh:.0f} vs 2000x1500"
 no_overlaps(zone_res, shape_chain(24))
 print("shape + zone OK")
+
+# ------------- wrapped layers stay put when re-sorted (column read-back)
+# A hub feeding many groups puts them all in one layer; wrapping splits it
+# into columns. Re-reading those columns by Y alone interleaved them, so
+# every re-sort reshuffled the groups (4700px jumps on a real template).
+def hub_groups(n_groups, wrap):
+    nodes = [node(1, "Src", [0, 0], [200, 80]), node(2, "Sink", [3000, 0], [200, 80])]
+    links, groups = [], []
+    for i in range(n_groups):
+        nid = 10 + i
+        h = 120 + (i * 37) % 90
+        nodes.append(node(nid, "Step", [600, i * 400 + 60], [260, h]))
+        links += [[100 + i, 1, 0, nid, 0, "X"], [200 + i, nid, 0, 2, 0, "X"]]
+        groups.append({"title": f"G{i}", "bounding": [580, i * 400, 300, h + 110]})
+    return {"nodes": nodes, "links": links, "groups": groups}
+
+
+for wrap_opts in ({"wrap_breadth": 700}, {"wrap_breadth": 700, "align": "top"}):
+    state = hub_groups(9, 700)
+    runs = []
+    for _ in range(3):
+        res = compute_layout(state, dict(wrap_opts, group_mode="cluster"))
+        runs.append(res)
+        apply_back(state, res)
+    assert runs[1]["positions"] == runs[2]["positions"], \
+        f"wrapped layer reshuffled on re-sort ({wrap_opts})"
+print("wrapped re-sort fixed point OK")
 print("ALL CHECKS PASSED")

@@ -313,8 +313,65 @@ def _assign_layers(items, edges):
     return layer, preds, succs, islands
 
 
-def _order_layers(items, layer, preds, succs, edges, sweeps):
-    """Barycenter ordering to reduce crossings; stable on original y.
+COLUMN_ALIGN_TOLERANCE = 11.0
+
+
+def _reading_order(items, members, direction):
+    """Initial in-layer order: along the cross axis — unless the layer
+    already sits in our own wrapped columns, in which case columns are
+    read one by one. Reading wrapped columns by cross position alone
+    interleaves them, so each re-sort would reshuffle the previous result
+    instead of being a fixed point.
+
+    Our wrapped placement has a fingerprint hand layouts almost never
+    match: several columns (items overlapping on the main axis form a
+    column), every multi-item column exactly centered on one axis
+    (left_to_right) or sharing one top edge (top_to_bottom), and single-
+    item columns sharing a cross-axis alignment line."""
+    if direction == "top_to_bottom":
+        cross, main, main_dim, cross_dim = "x", "y", "h", "w"
+        axis = lambda iid: items[iid]["y"]
+    else:
+        cross, main, main_dim, cross_dim = "y", "x", "w", "h"
+        axis = lambda iid: items[iid]["x"] + items[iid]["w"] / 2.0
+    fallback = sorted(members, key=lambda iid: (items[iid][cross],
+                                                items[iid][main]))
+    # Frames snap outward to the grid, shifting their centers/edges by up
+    # to one grid step — tolerate that (default grid 10px).
+    tol = COLUMN_ALIGN_TOLERANCE
+    if len(members) < 2:
+        return fallback
+    ordered = sorted(members, key=lambda iid: items[iid][main])
+    columns, reach = [], None
+    for iid in ordered:
+        start = items[iid][main]
+        end = start + items[iid][main_dim]
+        if columns and start < reach - 1e-6:
+            columns[-1].append(iid)
+            reach = max(reach, end)
+        else:
+            columns.append([iid])
+            reach = end
+    if len(columns) < 2:
+        return fallback
+    for column in columns:
+        values = [axis(iid) for iid in column]
+        if max(values) - min(values) > tol:
+            return fallback
+    if all(len(c) == 1 for c in columns):
+        singles = [c[0] for c in columns]
+        tops = [items[i][cross] for i in singles]
+        mids = [items[i][cross] + items[i][cross_dim] / 2.0 for i in singles]
+        if max(tops) - min(tops) > tol and max(mids) - min(mids) > tol:
+            return fallback
+    return [iid for column in columns
+            for iid in sorted(column, key=lambda i: items[i][cross])]
+
+
+def _order_layers(items, layer, preds, succs, edges, sweeps,
+                  direction="left_to_right"):
+    """Barycenter ordering to reduce crossings; stable on the original
+    reading order (see _reading_order).
 
     The upstream (succ-driven) sweep weighs each anchor by the consumer's
     input slot, so the several producers feeding one node stack in the
@@ -325,7 +382,7 @@ def _order_layers(items, layer, preds, succs, edges, sweeps):
         layers.setdefault(depth, []).append(iid)
     depths = sorted(layers)
     for depth in depths:
-        layers[depth].sort(key=lambda iid: (items[iid]["y"], items[iid]["x"]))
+        layers[depth] = _reading_order(items, layers[depth], direction)
 
     pred_anchors = {iid: [(p, 0.0) for p in preds[iid]] for iid in layer}
     succ_anchors = {}
@@ -347,8 +404,8 @@ def _order_layers(items, layer, preds, succs, edges, sweeps):
                            for n, weight in anchors_map.get(iid, ())
                            if n in index]
                 if not anchors:
-                    return (float(current[iid]), items[iid]["y"])
-                return (sum(anchors) / len(anchors), items[iid]["y"])
+                    return (float(current[iid]), current[iid])
+                return (sum(anchors) / len(anchors), current[iid])
 
             layers[depth].sort(key=key)
 
@@ -573,7 +630,8 @@ def _layered_layout(items, edges, direction, h_spacing, v_spacing, sweeps,
     if not items:
         return {}, (0.0, 0.0)
     layer, preds, succs, islands = _assign_layers(items, edges)
-    ordered_layers = _order_layers(items, layer, preds, succs, edges, sweeps)
+    ordered_layers = _order_layers(items, layer, preds, succs, edges, sweeps,
+                                   direction)
 
     bands = None
     band_gap = 2.0 * max(h_spacing, v_spacing)
@@ -915,6 +973,9 @@ def _inner_group_layout(nodes, edges, groups, direction, h_spacing,
 INNER_SEPARATION_MARGIN = 20.0
 
 
+PUSH_GRID = 10.0
+
+
 def _separate_inner_bodies(bodies):
     """Push overlapping rigid bodies apart after an inner-mode sort.
 
@@ -952,6 +1013,13 @@ def _separate_inner_bodies(bodies):
                     continue
                 # Later in reading order moves, away from the anchor side.
                 mover = second if (b[1], b[0]) >= (a[1], a[0]) else first
+                # Push by whole grid steps: frames snap outward while
+                # nodes snap to the nearest point, so an off-grid push
+                # would round the two differently and re-sorting would
+                # wobble by one step instead of being a fixed point.
+                step = PUSH_GRID
+                overlap_x = math.ceil((overlap_x + gap) / step) * step - gap
+                overlap_y = math.ceil((overlap_y + gap) / step) * step - gap
                 if overlap_x + gap <= overlap_y + gap:
                     mover["dx"] += overlap_x + gap
                 else:

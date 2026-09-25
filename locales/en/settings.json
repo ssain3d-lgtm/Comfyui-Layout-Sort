@@ -1,0 +1,30 @@
+{
+  "LayoutSort_direction": {
+    "name": "Flow direction",
+    "tooltip": "Used by the shortcut, right-click menu and selection toolbox when the workflow has no Layout Sort node (a node's own widgets win)."
+  },
+  "LayoutSort_layer_spacing": {
+    "name": "Gap between columns (px)",
+    "tooltip": "Used by the shortcut, right-click menu and selection toolbox when the workflow has no Layout Sort node (a node's own widgets win)."
+  },
+  "LayoutSort_node_spacing": {
+    "name": "Gap between nodes (px)",
+    "tooltip": "Used by the shortcut, right-click menu and selection toolbox when the workflow has no Layout Sort node (a node's own widgets win)."
+  },
+  "LayoutSort_group_mode": {
+    "name": "Group handling",
+    "tooltip": "Used by the shortcut, right-click menu and selection toolbox when the workflow has no Layout Sort node (a node's own widgets win)."
+  },
+  "LayoutSort_style": {
+    "name": "Column alignment",
+    "tooltip": "Used by the shortcut, right-click menu and selection toolbox when the workflow has no Layout Sort node (a node's own widgets win)."
+  },
+  "LayoutSort_shape": {
+    "name": "Overall shape",
+    "tooltip": "Used by the shortcut, right-click menu and selection toolbox when the workflow has no Layout Sort node (a node's own widgets win)."
+  },
+  "LayoutSort_animate": {
+    "name": "Animate node moves",
+    "tooltip": "Used by the shortcut, right-click menu and selection toolbox when the workflow has no Layout Sort node (a node's own widgets win)."
+  }
+}

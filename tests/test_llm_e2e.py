@@ -50,6 +50,9 @@ class MockLLMServer(ThreadingHTTPServer):
         self.reset()
 
     def reset(self):
+        # Each case scripts its own model reply; a cached plan from an
+        # earlier case would mask it.
+        layout_sort._plan_cache.clear()
         with getattr(self, "lock", threading.Lock()):
             self.requests = []           # [{"method","path","body","raw"}]
             self.chat_content = "{}"     # message.content returned on success
@@ -846,6 +849,42 @@ def case_progress_stages():
     res = layout_sort.run_layout(make_workflow(), {}, None, progress=boom)
     assert set(res["positions"]) == {str(n["id"])
                                      for n in make_workflow()["nodes"]}
+
+
+@case("21. unchanged workflow + same prompt reuses the plan (no 2nd call)")
+def case_plan_cache():
+    SERVER.reset()
+    SERVER.chat_content = CONTENT_HAPPY
+    cfg = {"prompt": PROMPT, "base_url": BASE, "model": ""}
+    first = layout_sort.run_layout(make_workflow(), {}, dict(cfg))
+    posts1 = [r for r in SERVER.snapshot() if r["method"] == "POST"]
+    stages = []
+    second = layout_sort.run_layout(make_workflow(), {}, dict(cfg),
+                                    progress=stages.append)
+    posts2 = [r for r in SERVER.snapshot() if r["method"] == "POST"]
+    assert len(posts1) == 1 and len(posts2) == 1, \
+        f"cached plan must not call the LLM again: {len(posts1)}, {len(posts2)}"
+    assert "llm_request" not in stages, stages
+    assert second["positions"] == first["positions"]
+    assert second["llm"]["applied"] == first["llm"]["applied"]
+
+    # A different prompt, or a changed graph, asks again.
+    layout_sort.run_layout(make_workflow(), {},
+                           {**cfg, "prompt": PROMPT + " 더 넓게"})
+    wf = make_workflow()
+    wf["nodes"].append({"id": 99, "type": "Extra", "pos": [0, 0],
+                        "size": [100, 50], "flags": {}})
+    layout_sort.run_layout(wf, {}, dict(cfg))
+    posts3 = [r for r in SERVER.snapshot() if r["method"] == "POST"]
+    assert len(posts3) == 3, len(posts3)
+
+    # Failures are never cached.
+    SERVER.reset()
+    SERVER.chat_content = "not json"
+    layout_sort.run_layout(make_workflow(), {}, dict(cfg))
+    SERVER.chat_content = CONTENT_HAPPY
+    res = layout_sort.run_layout(make_workflow(), {}, dict(cfg))
+    assert res["llm"]["used"] is True, res["llm"]
 
 
 # ---------------------------------------------------------------------------

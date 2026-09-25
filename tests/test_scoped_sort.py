@@ -164,7 +164,8 @@ def main():
                                        res["positions"][str(nid)]),
                            [40, 100, 900, 700]), \
             f"member {nid} left the fixed frame"
-    assert res["frames"] == {"count": 1, "overflow": []}, res.get("frames")
+    assert res["frames"] == {"count": 1, "overflow": [], "unchanged": [],
+                             "adjusted": []}, res.get("frames")
     print("fixed frame OK")
 
     # --- too-small frame: sorted anyway, overflow reported honestly
@@ -191,6 +192,68 @@ def main():
     assert set(res["positions"]) == {"4", "10", "9"}
     assert res["groups"] == [], res["groups"]
     print("mixed frame + loose OK")
+
+    # --- a tidy must never make a frame worse than the user's own
+    # arrangement: content that fit before and can't fit tidied (even
+    # with tighter spacing / the other direction) stays untouched
+    wf = {"nodes": [
+        {"id": 1, "type": "A", "pos": [20, 60], "size": [300, 300],
+         "flags": {}},
+        {"id": 2, "type": "B", "pos": [330, 60], "size": [300, 300],
+         "flags": {}},
+    ], "links": [[1, 1, 0, 2, 0, "X"]],
+       "groups": [{"title": "Snug", "bounding": [10, 20, 630, 350]}]}
+    res = layout_sort.run_layout(
+        wf, {"scope_ids": [1, 2], "h_spacing": 400,
+             "frames": [{"rect": [10, 20, 630, 350], "title": "Snug",
+                         "ids": [1, 2]}]})
+    assert res["frames"]["unchanged"] == ["Snug"], res["frames"]
+    assert res["positions"] == {}, "an unfittable tidy must not move nodes"
+    print("snug frame left unchanged OK")
+
+    # --- huge spacing that doesn't fit is tightened until it does
+    wf = make_workflow()
+    wf["groups"] = [{"title": "Roomy", "bounding": [40, 100, 900, 700]}]
+    res = layout_sort.run_layout(
+        wf, {"scope_ids": [4, 10], "v_spacing": 500, "h_spacing": 500,
+             "frames": [{"rect": [40, 100, 900, 700], "title": "Roomy",
+                         "ids": [4, 10]}]})
+    assert res["frames"]["overflow"] == [] \
+        and res["frames"]["adjusted"] == ["Roomy"], res["frames"]
+    nodes = node_map(wf)
+    for nid in (4, 10):
+        assert rect_inside(visual_rect(nodes[nid],
+                                       res["positions"][str(nid)]),
+                           [40, 100, 900, 700])
+    print("spacing auto-tightened OK")
+
+    # --- a small tight group (real template shape: a 4-node chain plus a
+    # Note in a 610x450 frame) gets a compact flow-ordered pack when no
+    # layered layout fits, instead of overflowing or giving up
+    wf = {"nodes": [
+        {"id": 80, "type": "VAEDecode", "pos": [2470, 170], "size": [210, 46], "flags": {}},
+        {"id": 96, "type": "ImageFromBatch", "pos": [2730, 170], "size": [210, 82], "flags": {}},
+        {"id": 95, "type": "LatentConcat", "pos": [2470, 260], "size": [210, 78], "flags": {}},
+        {"id": 94, "type": "LatentCut", "pos": [2470, 380], "size": [210, 106], "flags": {}},
+        {"id": 99, "type": "Note", "pos": [2720, 320], "size": [220, 90], "flags": {}},
+    ], "links": [[1, 94, 0, 95, 0, "LATENT"], [2, 95, 0, 80, 0, "LATENT"],
+                 [3, 80, 0, 96, 0, "IMAGE"]],
+       "groups": [{"title": "Fix frame", "bounding": [2430, 80, 610, 450]}]}
+    ids = [80, 96, 95, 94, 99]
+    res = layout_sort.run_layout(
+        wf, {"scope_ids": ids, "frames": [{"rect": [2430, 80, 610, 450],
+                                           "title": "Fix frame", "ids": ids}]})
+    assert res["frames"]["unchanged"] == [] and res["frames"]["overflow"] == [], \
+        res["frames"]
+    nodes = node_map(wf)
+    for nid in ids:
+        assert rect_inside(visual_rect(nodes[nid], res["positions"][str(nid)]),
+                           [2430, 80, 610, 450]), nid
+    # flow order preserved in reading order (94 -> 95 -> 80 -> 96)
+    order = sorted((94, 95, 80, 96), key=lambda n: (
+        res["positions"][str(n)][0], res["positions"][str(n)][1]))
+    assert order == [94, 95, 80, 96], order
+    print("compact pack fallback OK")
 
     print("ALL SCOPED-SORT TESTS PASSED")
 

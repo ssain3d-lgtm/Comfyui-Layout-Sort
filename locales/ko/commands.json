@@ -1,0 +1,32 @@
+{
+  "layoutSort_sort": {
+    "label": "레이아웃 정리: 선택 영역 정렬 (선택 없으면 전체)"
+  },
+  "layoutSort_sortWhole": {
+    "label": "레이아웃 정리: 워크플로우 전체 정렬"
+  },
+  "layoutSort_alignLeft": {
+    "label": "레이아웃 정리: 왼쪽 맞춤"
+  },
+  "layoutSort_alignRight": {
+    "label": "레이아웃 정리: 오른쪽 맞춤"
+  },
+  "layoutSort_alignTop": {
+    "label": "레이아웃 정리: 위쪽 맞춤"
+  },
+  "layoutSort_alignBottom": {
+    "label": "레이아웃 정리: 아래쪽 맞춤"
+  },
+  "layoutSort_centerHorizontal": {
+    "label": "레이아웃 정리: 가로 가운데 맞춤"
+  },
+  "layoutSort_centerVertical": {
+    "label": "레이아웃 정리: 세로 가운데 맞춤"
+  },
+  "layoutSort_distributeHorizontal": {
+    "label": "레이아웃 정리: 가로 간격 균등 분배"
+  },
+  "layoutSort_distributeVertical": {
+    "label": "레이아웃 정리: 세로 간격 균등 분배"
+  }
+}

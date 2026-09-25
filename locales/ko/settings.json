@@ -1,0 +1,30 @@
+{
+  "LayoutSort_direction": {
+    "name": "흐름 방향",
+    "tooltip": "워크플로우에 Layout Sort 노드가 없을 때 단축키·우클릭 메뉴·선택 툴박스가 사용하는 기본값입니다 (노드가 있으면 노드 설정이 우선)."
+  },
+  "LayoutSort_layer_spacing": {
+    "name": "열 사이 간격 (px)",
+    "tooltip": "워크플로우에 Layout Sort 노드가 없을 때 단축키·우클릭 메뉴·선택 툴박스가 사용하는 기본값입니다 (노드가 있으면 노드 설정이 우선)."
+  },
+  "LayoutSort_node_spacing": {
+    "name": "노드 사이 간격 (px)",
+    "tooltip": "워크플로우에 Layout Sort 노드가 없을 때 단축키·우클릭 메뉴·선택 툴박스가 사용하는 기본값입니다 (노드가 있으면 노드 설정이 우선)."
+  },
+  "LayoutSort_group_mode": {
+    "name": "그룹 처리 방식",
+    "tooltip": "워크플로우에 Layout Sort 노드가 없을 때 단축키·우클릭 메뉴·선택 툴박스가 사용하는 기본값입니다 (노드가 있으면 노드 설정이 우선)."
+  },
+  "LayoutSort_style": {
+    "name": "열 정렬 스타일",
+    "tooltip": "워크플로우에 Layout Sort 노드가 없을 때 단축키·우클릭 메뉴·선택 툴박스가 사용하는 기본값입니다 (노드가 있으면 노드 설정이 우선)."
+  },
+  "LayoutSort_shape": {
+    "name": "전체 모양",
+    "tooltip": "워크플로우에 Layout Sort 노드가 없을 때 단축키·우클릭 메뉴·선택 툴박스가 사용하는 기본값입니다 (노드가 있으면 노드 설정이 우선)."
+  },
+  "LayoutSort_animate": {
+    "name": "이동 애니메이션",
+    "tooltip": "워크플로우에 Layout Sort 노드가 없을 때 단축키·우클릭 메뉴·선택 툴박스가 사용하는 기본값입니다 (노드가 있으면 노드 설정이 우선)."
+  }
+}

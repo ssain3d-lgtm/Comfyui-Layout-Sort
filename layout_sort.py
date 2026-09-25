@@ -18,6 +18,9 @@ plain sort with the widget settings.
 """
 
 import asyncio
+import collections
+import copy
+import hashlib
 import functools
 import json
 import os
@@ -30,11 +33,13 @@ from .layout_core import (
     _center,
     _group_contains,
     _normalize_groups,
+    _normalize_links,
     _normalize_nodes,
     compute_layout,
 )
 from .llm_client import (
     DEFAULT_BASE_URL,
+    build_digest,
     format_origin,
     is_valid_api_key,
     list_models,
@@ -221,21 +226,130 @@ def _shift_result(positions, group_updates, reroutes, target_x, target_y):
     return dx, dy
 
 
+FIT_SPACING_SCALES = (1.0, 0.75, 0.5, 0.3)
+
+
+def _content_overflow(positions, frame_updates, nodes, rect):
+    """(overflow_w, overflow_h) of placed content past the frame's
+    right/bottom edges (content is anchored at the padded top-left)."""
+    right = [p[0] + nodes[_nid_key(nodes, k)]["w"]
+             for k, p in positions.items()]
+    bottom = [p[1] - TITLE_HEIGHT + nodes[_nid_key(nodes, k)]["h"]
+              for k, p in positions.items()]
+    right += [u["bounding"][0] + u["bounding"][2] for u in frame_updates]
+    bottom += [u["bounding"][1] + u["bounding"][3] for u in frame_updates]
+    over_w = max([0.0] + [r - (rect[0] + rect[2]) for r in right])
+    over_h = max([0.0] + [b - (rect[1] + rect[3]) for b in bottom])
+    return over_w, over_h
+
+
+def _fits_originally(nodes, rect):
+    """Did every member already sit fully inside the frame?"""
+    return all(
+        n["x"] >= rect[0] - 1.0 and n["y"] >= rect[1] - 1.0
+        and n["x"] + n["w"] <= rect[0] + rect[2] + 1.0
+        and n["y"] + n["h"] <= rect[1] + rect[3] + 1.0
+        for n in nodes.values())
+
+
+def _flow_order(nodes, edges):
+    """Topological (data-flow) order, ties broken by the user's reading
+    order (top-to-bottom, left-to-right); cycles fall back gracefully."""
+    indeg = {nid: 0 for nid in nodes}
+    succ = {nid: [] for nid in nodes}
+    for o, t in edges:
+        if o in nodes and t in nodes and o != t:
+            succ[o].append(t)
+            indeg[t] += 1
+    key = lambda nid: (nodes[nid]["y"], nodes[nid]["x"])
+    ready = sorted([n for n, d in indeg.items() if d == 0], key=key)
+    order, seen = [], set()
+    while ready or len(order) < len(nodes):
+        if not ready:  # cycle: take the earliest remaining node
+            ready = [min((n for n in nodes if n not in seen), key=key)]
+        nid = ready.pop(0)
+        if nid in seen:
+            continue
+        seen.add(nid)
+        order.append(nid)
+        for t in succ[nid]:
+            indeg[t] -= 1
+            if indeg[t] <= 0 and t not in seen:
+                ready.append(t)
+        ready.sort(key=key)
+    return order
+
+
+def _compact_pack(nodes, order, width, height, gap, column_major):
+    """Pack nodes in flow order into columns (or rows) inside a
+    width x height box — how people tidy a small group by hand. Returns
+    visual top-left positions relative to the box, or None if it can't
+    fit."""
+    positions = {}
+    if column_major:
+        x = y = col_w = 0.0
+        for nid in order:
+            n = nodes[nid]
+            if y > 0 and y + n["h"] > height:
+                x += col_w + gap
+                y = col_w = 0.0
+            positions[nid] = [x, y]
+            y += n["h"] + gap
+            col_w = max(col_w, n["w"])
+        used_w, used_h = x + col_w, max(
+            p[1] + nodes[i]["h"] for i, p in positions.items())
+    else:
+        x = y = row_h = 0.0
+        for nid in order:
+            n = nodes[nid]
+            if x > 0 and x + n["w"] > width:
+                y += row_h + gap
+                x = row_h = 0.0
+            positions[nid] = [x, y]
+            x += n["w"] + gap
+            row_h = max(row_h, n["h"])
+        used_w = max(p[0] + nodes[i]["w"] for i, p in positions.items())
+        used_h = y + row_h
+    if used_w > width + 1.0 or used_h > height + 1.0:
+        return None
+    return positions
+
+
 def _fit_frame_sorts(workflow, frames, options):
     """Sort each selected populated group INSIDE its own frame.
 
     The frame is the user's decision, so it is never moved or resized:
     its interior (minus the title/side padding) becomes the target box —
     members re-arrange to its proportions and land at its corner. Nested
-    child frames still refit around their content. Content larger than
-    the frame overflows right/down and is reported.
+    child frames still refit around their content.
+
+    A tidy must never make things worse than the user's own arrangement,
+    so candidates are tried in order of how little they deviate from the
+    widget settings — the requested direction at full, 75%, 50% spacing,
+    then the other direction, then 30% spacing — and the first that fits
+    wins. If nothing fits: when the members already fit before, the group
+    is left exactly as it was; otherwise the least-overflowing candidate
+    is used and reported.
 
     Returns (positions, group_updates with live indices, reroutes,
-    overflow_frame_titles)."""
-    positions, updates, reroutes, overflow = {}, [], {}, []
+    report) where report = {"overflow", "unchanged", "adjusted"} lists of
+    frame titles."""
+    positions, updates, reroutes = {}, [], {}
+    report = {"overflow": [], "unchanged": [], "adjusted": []}
     raw_groups = workflow.get("groups") or []
+    base_dir = options.get("direction") or "left_to_right"
+    other_dir = ("top_to_bottom" if base_dir != "top_to_bottom"
+                 else "left_to_right")
+    base_h = float(options.get("h_spacing") or 80)
+    base_v = float(options.get("v_spacing") or 40)
+    candidates = (
+        [(base_dir, s) for s in FIT_SPACING_SCALES[:3]]
+        + [(other_dir, s) for s in FIT_SPACING_SCALES[:3]]
+        + [(base_dir, FIT_SPACING_SCALES[3]), (other_dir, FIT_SPACING_SCALES[3])]
+    )
     for frame in frames:
         rect = frame["rect"]
+        title = str(frame.get("title") or "group")
         scoped, index_map = _scoped_workflow(workflow, frame["ids"])
         # Drop the outer frame itself from the copy (matched by rect):
         # it must be neither refit nor parked.
@@ -252,36 +366,77 @@ def _fit_frame_sorts(workflow, frames, options):
             inner_groups.append(scoped["groups"][scoped_idx])
         scoped = dict(scoped)
         scoped["groups"] = inner_groups
+        nodes = _normalize_nodes(scoped)
+        if not nodes:
+            continue
 
         interior_w = max(rect[2] - GROUP_SIDE_PADDING * 2.0, 100.0)
         interior_h = max(rect[3] - GROUP_TITLE_PADDING - GROUP_SIDE_PADDING,
                          100.0)
-        opts = dict(options)
-        opts["zone_size"] = [interior_w, interior_h]
-        result = compute_layout(scoped, opts)
+        best = None
+        for index, (direction, scale) in enumerate(candidates):
+            opts = dict(options)
+            opts["zone_size"] = [interior_w, interior_h]
+            opts["direction"] = direction
+            opts["h_spacing"] = max(10.0, round(base_h * scale))
+            opts["v_spacing"] = max(10.0, round(base_v * scale))
+            result = compute_layout(scoped, opts)
+            frame_updates = [
+                {**u, "index": chain[u["index"]]}
+                for u in result.get("groups") or []
+                if u["index"] in chain
+            ]
+            _shift_result(result["positions"], frame_updates,
+                          result.get("reroutes") or {},
+                          rect[0] + GROUP_SIDE_PADDING,
+                          rect[1] + GROUP_TITLE_PADDING)
+            over_w, over_h = _content_overflow(result["positions"],
+                                               frame_updates, nodes, rect)
+            badness = over_w * rect[3] + over_h * rect[2] + over_w * over_h
+            if best is None or badness < best[0]:
+                best = (badness, index, result, frame_updates)
+            if badness <= 1.0:
+                break
 
-        frame_updates = [
-            {**u, "index": chain[u["index"]]}
-            for u in result.get("groups") or []
-            if u["index"] in chain
-        ]
-        _shift_result(result["positions"], frame_updates,
-                      result.get("reroutes") or {},
-                      rect[0] + GROUP_SIDE_PADDING,
-                      rect[1] + GROUP_TITLE_PADDING)
-        nodes = _normalize_nodes(scoped)
-        content_w = max(
-            [p[0] + nodes[_nid_key(nodes, k)]["w"] - rect[0]
-             for k, p in result["positions"].items()] or [0.0])
-        content_h = max(
-            [p[1] - TITLE_HEIGHT + nodes[_nid_key(nodes, k)]["h"] - rect[1]
-             for k, p in result["positions"].items()] or [0.0])
-        if (content_w > rect[2] + 1.0 or content_h > rect[3] + 1.0):
-            overflow.append(str(frame.get("title") or "group"))
+        badness, index, result, frame_updates = best
+        if badness > 1.0 and not inner_groups:
+            # Layered layouts can't fit: try a compact flow-ordered pack
+            # (columns first, then rows) at shrinking gaps.
+            edges = [(o, t) for o, t, _slot in
+                     _normalize_links(scoped, nodes)]
+            order = _flow_order(nodes, edges)
+            for scale in (0.5, 0.3, 0.0):
+                gap = max(10.0, round(base_v * scale))
+                packed = None
+                for column_major in (True, False):
+                    packed = _compact_pack(nodes, order, interior_w,
+                                           interior_h, gap, column_major)
+                    if packed:
+                        break
+                if packed:
+                    x0 = rect[0] + GROUP_SIDE_PADDING
+                    y0 = rect[1] + GROUP_TITLE_PADDING
+                    result = {"positions": {
+                        str(nid): [round((x0 + p[0]) / 10.0) * 10.0,
+                                   round((y0 + p[1]) / 10.0) * 10.0
+                                   + TITLE_HEIGHT]
+                        for nid, p in packed.items()}, "reroutes": {}}
+                    over_w, over_h = _content_overflow(
+                        result["positions"], [], nodes, rect)
+                    if over_w <= 1.0 and over_h <= 1.0:
+                        badness, index, frame_updates = 0.0, 1, []
+                        break
+        if badness > 1.0 and _fits_originally(nodes, rect):
+            report["unchanged"].append(title)
+            continue
+        if badness > 1.0:
+            report["overflow"].append(title)
+        elif index > 0:
+            report["adjusted"].append(title)
         positions.update(result["positions"])
         updates.extend(frame_updates)
         reroutes.update(result.get("reroutes") or {})
-    return positions, updates, reroutes, overflow
+    return positions, updates, reroutes, report
 
 
 def _nid_key(nodes, key):
@@ -371,6 +526,20 @@ def _drop_empty_group(workflow, index):
     out["groups"] = [g for i, g in enumerate(raw_groups) if i != index]
     survivors = [i for i in range(len(raw_groups)) if i != index]
     return out, {new: old for new, old in enumerate(survivors)}
+
+
+# Successful LLM plans keyed by (request, endpoint, model, graph digest):
+# re-running an unchanged workflow with the same prompt (e.g. every queue
+# run with the node in the graph) must not pay for another LLM call.
+PLAN_CACHE_SIZE = 16
+_plan_cache = collections.OrderedDict()
+
+
+def _plan_cache_key(workflow, prompt, options, base_url, model, max_tokens):
+    digest = build_digest(workflow, options)
+    raw = json.dumps([prompt, base_url, str(model or ""), str(max_tokens),
+                      digest], sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def run_layout(workflow, options, llm_cfg=None, progress=None):
@@ -485,19 +654,32 @@ def run_layout(workflow, options, llm_cfg=None, progress=None):
         else:
             stored = load_stored_key_info()
             api_key, key_origin = stored["api_key"], stored["allowed_origin"]
-        notify("llm_request")
-        plan, error = plan_layout(
-            workflow, prompt,
-            current_options=options,
-            base_url=resolve_base_url(llm_cfg.get("provider"),
-                                      llm_cfg.get("base_url")),
-            model=llm_cfg.get("model") or "",
-            timeout=LLM_TIMEOUT_SECONDS,
-            api_key=api_key,
-            key_origin=key_origin,
-            max_tokens=llm_cfg.get("max_tokens"),
-        )
-        notify("llm_done")
+        base_url = resolve_base_url(llm_cfg.get("provider"),
+                                    llm_cfg.get("base_url"))
+        cache_key = _plan_cache_key(workflow, prompt, options, base_url,
+                                    llm_cfg.get("model"),
+                                    llm_cfg.get("max_tokens"))
+        cached = _plan_cache.get(cache_key)
+        if cached is not None:
+            _plan_cache.move_to_end(cache_key)
+            plan, error = copy.deepcopy(cached), None
+        else:
+            notify("llm_request")
+            plan, error = plan_layout(
+                workflow, prompt,
+                current_options=options,
+                base_url=base_url,
+                model=llm_cfg.get("model") or "",
+                timeout=LLM_TIMEOUT_SECONDS,
+                api_key=api_key,
+                key_origin=key_origin,
+                max_tokens=llm_cfg.get("max_tokens"),
+            )
+            notify("llm_done")
+            if not error and plan is not None:
+                _plan_cache[cache_key] = copy.deepcopy(plan)
+                while len(_plan_cache) > PLAN_CACHE_SIZE:
+                    _plan_cache.popitem(last=False)
         if error:
             llm_info = {"used": False, "error": error}
         else:
@@ -576,13 +758,13 @@ def run_layout(workflow, options, llm_cfg=None, progress=None):
         fit_options = {k: v for k, v in options.items()
                        if k != "zone_size"}
         fit_options["group_mode"] = "cluster"
-        f_positions, f_updates, f_reroutes, f_overflow = _fit_frame_sorts(
+        f_positions, f_updates, f_reroutes, f_report = _fit_frame_sorts(
             frames_workflow, frames, fit_options)
         result["positions"].update(f_positions)
         result["groups"] = (result.get("groups") or []) + f_updates
         result["reroutes"] = {**(result.get("reroutes") or {}),
                               **f_reroutes}
-        result["frames"] = {"count": len(frames), "overflow": f_overflow}
+        result["frames"] = {"count": len(frames), **f_report}
     # Frame updates are index-based; the frontend compares this against
     # the live graph so frames added/removed during a slow LLM round-trip
     # can never receive another frame's geometry.

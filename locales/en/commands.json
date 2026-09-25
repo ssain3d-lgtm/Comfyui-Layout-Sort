@@ -1,0 +1,32 @@
+{
+  "layoutSort_sort": {
+    "label": "Layout Sort: sort selection (or whole graph)"
+  },
+  "layoutSort_sortWhole": {
+    "label": "Layout Sort: sort whole workflow (ignore selection)"
+  },
+  "layoutSort_alignLeft": {
+    "label": "Layout Sort: align left"
+  },
+  "layoutSort_alignRight": {
+    "label": "Layout Sort: align right"
+  },
+  "layoutSort_alignTop": {
+    "label": "Layout Sort: align top"
+  },
+  "layoutSort_alignBottom": {
+    "label": "Layout Sort: align bottom"
+  },
+  "layoutSort_centerHorizontal": {
+    "label": "Layout Sort: center on vertical axis"
+  },
+  "layoutSort_centerVertical": {
+    "label": "Layout Sort: center on horizontal axis"
+  },
+  "layoutSort_distributeHorizontal": {
+    "label": "Layout Sort: distribute horizontally (equal gaps)"
+  },
+  "layoutSort_distributeVertical": {
+    "label": "Layout Sort: distribute vertically (equal gaps)"
+  }
+}

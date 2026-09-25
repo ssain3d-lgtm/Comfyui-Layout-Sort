@@ -127,14 +127,16 @@ function notifyLlm(llm) {
 function applyLayout({ positions, groups, new_groups, reroutes, llm, animate,
                        group_count }) {
     const moves = collectMoves(positions);
-    if (!moves.length) return;
+    if (!moves.length) return 0;
     // A broadcast event may reach a tab showing a different workflow;
     // only apply (or toast) when the ids clearly belong to this graph.
     const total = Object.keys(positions ?? {}).length;
     if (total > 0 && moves.length / total < 0.9) {
         console.warn(`[LayoutSort] ignoring layout for a different graph (${moves.length}/${total} ids matched)`);
-        return;
+        return 0;
     }
+    const displaced = moves.filter((m) => Math.abs(m.to[0] - m.from[0]) > 0.5
+        || Math.abs(m.to[1] - m.from[1]) > 0.5).length;
     notifyLlm(llm);
 
     // One sort = one undo step: the frontend's change tracker snapshots
@@ -166,7 +168,7 @@ function applyLayout({ positions, groups, new_groups, reroutes, llm, animate,
 
     if (!animate) {
         finish();
-        return;
+        return displaced;
     }
 
     const duration = 350;
@@ -187,10 +189,77 @@ function applyLayout({ positions, groups, new_groups, reroutes, llm, animate,
         }
     };
     requestAnimationFrame(frame);
+    return displaced;
 }
 
 function widgetValue(node, name, fallback) {
     return node?.widgets?.find((w) => w.name === name)?.value ?? fallback;
+}
+
+// Defaults for sorts started without a LayoutSort node on the canvas
+// (shortcut, right-click menu, selection toolbox). A node on the canvas
+// still wins, so per-workflow settings keep working.
+const SETTING_PREFIX = "LayoutSort.";
+const SETTINGS = [
+    { key: "direction", widget: "direction", name: "Flow direction",
+      type: "combo", options: ["left_to_right", "top_to_bottom"],
+      defaultValue: "left_to_right" },
+    { key: "layer_spacing", widget: "layer_spacing",
+      name: "Gap between columns (px)", type: "number",
+      attrs: { min: 10, max: 500, step: 10 }, defaultValue: 80 },
+    { key: "node_spacing", widget: "node_spacing",
+      name: "Gap between nodes (px)", type: "number",
+      attrs: { min: 10, max: 500, step: 10 }, defaultValue: 40 },
+    { key: "group_mode", widget: "group_mode", name: "Group handling",
+      type: "combo", options: ["cluster", "inner", "refit"],
+      defaultValue: "cluster",
+      tooltip: "cluster: groups become blocks · inner: groups stay where "
+          + "they are, only their insides are tidied · refit: ignore groups" },
+    { key: "style", widget: "style", name: "Column alignment",
+      type: "combo", options: ["flow", "grid"], defaultValue: "flow" },
+    { key: "shape", widget: "shape", name: "Overall shape",
+      type: "combo", options: ["auto", "square", "wide", "tall"],
+      defaultValue: "auto" },
+    { key: "animate", widget: "animate", name: "Animate node moves",
+      type: "boolean", defaultValue: true },
+];
+
+function settingValue(key, fallback) {
+    try {
+        const v = app.extensionManager?.setting?.get?.(SETTING_PREFIX + key);
+        return v ?? fallback;
+    } catch (err) {
+        return fallback;
+    }
+}
+
+function option(node, key, fallback) {
+    const spec = SETTINGS.find((s) => s.key === key);
+    const fromNode = node?.widgets?.find((w) => w.name === (spec?.widget ?? key));
+    if (fromNode && fromNode.value !== undefined && fromNode.value !== null) {
+        return fromNode.value;
+    }
+    return settingValue(key, spec?.defaultValue ?? fallback);
+}
+
+function renderedSizes(workflow) {
+    // Nodes 2.0 (Vue) renders many nodes taller than their stored size;
+    // lay out with what is actually on screen so nothing overlaps.
+    // Only the compute copy is patched — real node sizes never change.
+    const scale = app.canvas?.ds?.scale;
+    if (!scale) return;
+    for (const n of workflow.nodes ?? []) {
+        const el = document.querySelector(`[data-node-id="${n.id}"]`);
+        if (!el || !Array.isArray(n.size)) continue;
+        const r = el.getBoundingClientRect();
+        if (!r.width || !r.height) continue;
+        const w = r.width / scale;
+        const bodyH = r.height / scale - 30;
+        if (w > n.size[0] + 2) n.size[0] = Math.ceil(w);
+        if (!n.flags?.collapsed && bodyH > n.size[1] + 2) {
+            n.size[1] = Math.ceil(bodyH);
+        }
+    }
 }
 
 function isGroupItem(item) {
@@ -433,43 +502,59 @@ function onProgressEvent(stage) {
     }
 }
 
-async function sortNow(node) {
-    // Also runs from the command palette with no LayoutSort node on the
-    // canvas (node = null): widget reads fall back to defaults.
+async function sortNow(node, mode = {}) {
+    // Also runs from the shortcut, the right-click menu and the selection
+    // toolbox with no LayoutSort node on the canvas (node = null): options
+    // then come from Settings → Layout Sort.
+    //   mode.whole  — ignore the selection, sort the whole workflow
+    //   mode.group  — tidy inside this one group frame (frame kept)
     const busyHolder = node ?? sortNow;
     if (busyHolder.__layoutSortBusy) return;
     busyHolder.__layoutSortBusy = true;
     beginProgress(node,
         String(widgetValue(node, "llm_prompt", "")).trim().length > 0);
     const workflow = app.graph.serialize();
+    renderedSizes(workflow);
     const options = {
-        direction: widgetValue(node, "direction", "left_to_right"),
-        h_spacing: widgetValue(node, "layer_spacing", 80),
-        v_spacing: widgetValue(node, "node_spacing", 40),
-        group_mode: widgetValue(node, "group_mode", "cluster"),
-        style: widgetValue(node, "style", "flow"),
-        shape: widgetValue(node, "shape", "auto"),
+        direction: option(node, "direction", "left_to_right"),
+        h_spacing: option(node, "layer_spacing", 80),
+        v_spacing: option(node, "node_spacing", 40),
+        group_mode: option(node, "group_mode", "cluster"),
+        style: option(node, "style", "flow"),
+        shape: option(node, "shape", "auto"),
     };
-    // 2+ selected nodes (or selected group frames) = sort only those,
-    // anchored where the selection sits; everything else stays put.
-    const scope = selectionScope();
-    if (scope.length >= 2) options.scope_ids = scope;
-    // A selected EMPTY group frame = drawn zone to fit the layout into.
-    const zone = selectedZone();
-    if (zone) {
-        options.zone = zone.rect;
-        options.zone_index = zone.index;
+    const groups = mode.group ? [mode.group]
+        : mode.whole ? [] : selectedGroups();
+    if (!mode.whole && !mode.group) {
+        // 2+ selected nodes (or selected group frames) = sort only
+        // those, anchored where the selection sits; the rest stays put.
+        const scope = selectionScope();
+        if (scope.length >= 2) options.scope_ids = scope;
+        // A selected EMPTY group frame = drawn zone to fit into.
+        const zone = selectedZone();
+        if (zone) {
+            options.zone = zone.rect;
+            options.zone_index = zone.index;
+        }
     }
     // Selected POPULATED group frames sort in place: members re-arrange
     // inside the frame, the frame itself keeps its exact size/position.
     const frames = [];
-    for (const group of selectedGroups()) {
+    for (const group of groups) {
         const members = groupMembers(group);
         if (!members.length) continue;
         frames.push({ rect: groupRect(group), title: group.title,
                       ids: members.map((n) => n.id) });
     }
-    if (frames.length) options.frames = frames;
+    if (frames.length) {
+        options.frames = frames;
+        if (mode.group) options.scope_ids = frames[0].ids;
+    } else if (mode.group) {
+        toolToast("This group frame is empty — nothing to tidy.");
+        endProgress();
+        busyHolder.__layoutSortBusy = false;
+        return;
+    }
     // The API key is deliberately absent here: it lives server-side only
     // (key dialog / env var) and must never enter the graph or this payload.
     const llm = {
@@ -493,20 +578,40 @@ async function sortNow(node) {
             new_groups: result.new_groups,
             reroutes: result.reroutes,
             llm: result.llm,
-            animate: widgetValue(node, "animate", true),
+            animate: option(node, "animate", true),
             group_count: result.group_count,
         });
+        const moved = Object.keys(result.positions ?? {}).length;
         if (options.frames) {
-            toolToast(`Tidied ${options.frames.length} group frame(s) in `
-                + "place (size unchanged).");
-            if (result.frames?.overflow?.length) {
+            const rep = result.frames ?? {};
+            const done = options.frames.length
+                - (rep.unchanged?.length ?? 0);
+            if (done > 0) {
+                toolToast(`Tidied ${done} group(s) inside their frames `
+                    + "(frame size kept) — Ctrl+Z to undo.", "success");
+            }
+            if (rep.adjusted?.length) {
+                toolToast(`Spacing/direction adjusted so it fits: `
+                    + rep.adjusted.join(", "));
+            }
+            if (rep.unchanged?.length) {
+                toolToast(`Left as is (a tidy layout can't fit the frame): `
+                    + `${rep.unchanged.join(", ")} — enlarge the frame `
+                    + "to tidy it.", "warn");
+            }
+            if (rep.overflow?.length) {
                 toolToast("Content overflows: "
-                    + `${result.frames.overflow.join(", ")} — enlarge the `
-                    + "frame or reduce spacing.", "warn");
+                    + `${rep.overflow.join(", ")} — enlarge the frame `
+                    + "or reduce spacing.", "warn");
             }
         } else if (options.scope_ids) {
-            const moved = Object.keys(result.positions ?? {}).length;
-            toolToast(`Sorted ${moved} selected node(s); the rest stayed put.`);
+            toolToast(`Sorted ${moved} selected node(s); the rest stayed `
+                + "put — Ctrl+Z to undo.", "success");
+        } else if (!options.zone) {
+            const g = result.groups?.length ?? 0;
+            toolToast(`Sorted ${moved} node(s)`
+                + (g ? ` and ${g} group frame(s)` : "")
+                + " — Ctrl+Z to undo.", "success");
         }
         if (options.zone) {
             // Truthful feedback: the backend reports whether the zone
@@ -778,33 +883,131 @@ async function connectModels(node) {
     }
 }
 
+const LLM_PROPERTY = "Show LLM options";
+const LLM_WIDGETS = ["llm_provider", "llm_base_url", "llm_model",
+                     "llm_max_tokens", "🔌 Connect (load models)"];
+
+function fitNodeHeight(node) {
+    try {
+        const size = node.computeSize?.();
+        if (size) node.setSize?.([node.size[0], size[1]]);
+        node.setDirtyCanvas?.(true, true);
+    } catch (err) { /* keep the current size */ }
+}
+
+function applyLlmVisibility(node, show, resize) {
+    // widget.hidden drives the classic canvas (layout AND drawing);
+    // options.hidden drives the Vue renderer. Set both.
+    node.properties = node.properties ?? {};
+    node.properties[LLM_PROPERTY] = show;
+    for (const w of node.widgets ?? []) {
+        const isLlm = LLM_WIDGETS.includes(w.name)
+            || w.name === KEY_BUTTON_UNSET || w.name === KEY_BUTTON_SET;
+        if (!isLlm) continue;
+        w.hidden = !show;
+        w.options = w.options ?? {};
+        w.options.hidden = !show;
+    }
+    if (resize) fitNodeHeight(node);
+}
+
+function sortWhole() {
+    sortNow(findSortNode(), { whole: true });
+}
+
+function sortSelectionOrWhole() {
+    sortNow(findSortNode());
+}
+
+function layoutMenuItems(canvas) {
+    // Right-click menu entries: the discoverable way in, no node or
+    // shortcut knowledge needed.
+    const items = [null];
+    const graph = canvas?.graph ?? app.graph;
+    let group = null;
+    try {
+        group = graph?.getGroupOnPos?.(canvas.graph_mouse[0],
+                                       canvas.graph_mouse[1]) ?? null;
+    } catch (err) { group = null; }
+    if (group && groupMembers(group).length) {
+        items.push({
+            content: "📐 Tidy inside this group (keep frame size)",
+            callback: () => sortNow(findSortNode(), { group }),
+        });
+    }
+    const selected = selectionScope().length;
+    const sub = [
+        { content: "Sort whole workflow", callback: sortWhole },
+    ];
+    if (selected >= 2) {
+        sub.push({ content: `Sort selected only (${selected} nodes)`,
+                   callback: sortSelectionOrWhole });
+    }
+    if (selectedNodes().length >= 2) {
+        sub.push(null,
+            { content: "Align left", callback: () => alignSelected("left") },
+            { content: "Align right", callback: () => alignSelected("right") },
+            { content: "Align top", callback: () => alignSelected("top") },
+            { content: "Align bottom", callback: () => alignSelected("bottom") },
+            { content: "Center horizontally", callback: () => alignSelected("center_h") },
+            { content: "Center vertically", callback: () => alignSelected("center_v") });
+    }
+    if (selectedNodes().length >= 3) {
+        sub.push(
+            { content: "Distribute horizontally", callback: () => distributeSelected("h") },
+            { content: "Distribute vertically", callback: () => distributeSelected("v") });
+    }
+    items.push({ content: "🧹 Layout Sort", has_submenu: true,
+                 submenu: { options: sub } });
+    return items;
+}
+
 app.registerExtension({
     name: "comfyui.layout.sort",
+    settings: SETTINGS.map((spec) => ({
+        id: SETTING_PREFIX + spec.key,
+        category: ["Layout Sort", "Defaults", spec.name],
+        name: spec.name,
+        type: spec.type,
+        defaultValue: spec.defaultValue,
+        options: spec.options,
+        attrs: spec.attrs,
+        tooltip: (spec.tooltip ? spec.tooltip + " — " : "")
+            + "Used by the shortcut and right-click menu when the "
+            + "workflow has no Layout Sort node (a node's own widgets win).",
+    })),
     // All ops live in the command palette and are rebindable in ComfyUI's
     // keybinding settings; three ship with defaults that avoid the stock
     // shortcuts.
     commands: [
-        { id: "layoutSort.sort",
+        { id: "layoutSort.sort", icon: "pi pi-sitemap",
           label: "Layout Sort: sort selection (or whole graph)",
-          function: () => sortNow(findSortNode()) },
-        { id: "layoutSort.alignLeft", label: "Layout Sort: align left",
+          function: sortSelectionOrWhole },
+        { id: "layoutSort.sortWhole", icon: "pi pi-sitemap",
+          label: "Layout Sort: sort whole workflow (ignore selection)",
+          function: sortWhole },
+        { id: "layoutSort.alignLeft", icon: "pi pi-align-left",
+          label: "Layout Sort: align left",
           function: () => alignSelected("left") },
-        { id: "layoutSort.alignRight", label: "Layout Sort: align right",
+        { id: "layoutSort.alignRight", icon: "pi pi-align-right",
+          label: "Layout Sort: align right",
           function: () => alignSelected("right") },
-        { id: "layoutSort.alignTop", label: "Layout Sort: align top",
+        { id: "layoutSort.alignTop", icon: "pi pi-arrow-up",
+          label: "Layout Sort: align top",
           function: () => alignSelected("top") },
-        { id: "layoutSort.alignBottom", label: "Layout Sort: align bottom",
+        { id: "layoutSort.alignBottom", icon: "pi pi-arrow-down",
+          label: "Layout Sort: align bottom",
           function: () => alignSelected("bottom") },
-        { id: "layoutSort.centerHorizontal",
+        { id: "layoutSort.centerHorizontal", icon: "pi pi-align-center",
           label: "Layout Sort: center on vertical axis",
           function: () => alignSelected("center_h") },
-        { id: "layoutSort.centerVertical",
+        { id: "layoutSort.centerVertical", icon: "pi pi-align-justify",
           label: "Layout Sort: center on horizontal axis",
           function: () => alignSelected("center_v") },
-        { id: "layoutSort.distributeHorizontal",
+        { id: "layoutSort.distributeHorizontal", icon: "pi pi-arrows-h",
           label: "Layout Sort: distribute horizontally (equal gaps)",
           function: () => distributeSelected("h") },
-        { id: "layoutSort.distributeVertical",
+        { id: "layoutSort.distributeVertical", icon: "pi pi-arrows-v",
           label: "Layout Sort: distribute vertically (equal gaps)",
           function: () => distributeSelected("v") },
     ],
@@ -816,8 +1019,22 @@ app.registerExtension({
         { combo: { key: "v", alt: true, shift: true },
           commandId: "layoutSort.distributeVertical" },
     ],
+    getCanvasMenuItems(canvas) {
+        return layoutMenuItems(canvas);
+    },
+    getSelectionToolboxCommands() {
+        // One-click sort in the floating toolbox shown over a selection.
+        return ["layoutSort.sort"];
+    },
     setup() {
-        api.addEventListener(WS_EVENT, ({ detail }) => applyLayout(detail ?? {}));
+        api.addEventListener(WS_EVENT, ({ detail }) => {
+            // Sorts triggered by running the workflow (the node executed).
+            const moved = applyLayout(detail ?? {});
+            if (moved > 0) {
+                toolToast(`Layout Sort node ran: ${moved} node(s) moved — `
+                    + "Ctrl+Z to undo.", "success");
+            }
+        });
         api.addEventListener(PROGRESS_EVENT,
             ({ detail }) => onProgressEvent(detail?.stage));
     },
@@ -831,12 +1048,35 @@ app.registerExtension({
             this.addWidget("button", SORT_BUTTON, null, () => sortNow(this));
             this.addWidget("button", "🔌 Connect (load models)", null,
                 () => connectModels(this));
-            this.addWidget("button", KEY_BUTTON_UNSET, null, () => manageApiKey(this));
+            this.addWidget("button", KEY_BUTTON_UNSET, null,
+                () => manageApiKey(this));
+            // LLM plumbing is optional: collapsed until "Show LLM options"
+            // (node right-click menu). Fit the shorter node once the
+            // frontend finished its own post-create sizing — but never
+            // override a size a loaded workflow saved.
+            applyLlmVisibility(this, false, false);
+            setTimeout(() => {
+                if (this.__layoutSortConfigured) return;
+                fitNodeHeight(this);
+            }, 0);
             refreshKeyStatus(this);
+        };
+        const getExtraMenuOptions = nodeType.prototype.getExtraMenuOptions;
+        nodeType.prototype.getExtraMenuOptions = function (canvas, options) {
+            const r = getExtraMenuOptions?.apply(this, arguments);
+            const shown = !!this.properties?.[LLM_PROPERTY];
+            options?.unshift?.({
+                content: shown ? "Hide LLM options" : "Show LLM options",
+                callback: () => applyLlmVisibility(this, !shown, true),
+            }, null);
+            return r;
         };
         const onConfigure = nodeType.prototype.onConfigure;
         nodeType.prototype.onConfigure = function () {
             onConfigure?.apply(this, arguments);
+            this.__layoutSortConfigured = true;
+            // Restore the per-workflow LLM section state (keep saved size).
+            applyLlmVisibility(this, !!this.properties?.[LLM_PROPERTY], false);
             // Runs after saved widget values are applied — repair values
             // shifted by older saves before they reach the backend.
             sanitizeWidgets(this);
