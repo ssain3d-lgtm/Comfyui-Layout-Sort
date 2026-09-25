@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-layout-sort"
-version = "0.16.0"
-description = "Auto-arranges the current ComfyUI workflow into a clean layered layout based on its data flow, via node execution or a one-click button. Optionally, a natural-language prompt (via LM Studio/Ollama/OpenAI/Anthropic) steers direction, spacing, group mode, style and named clusters — geometry stays deterministic."
+version = "0.17.0"
+description = "Auto-arranges the current ComfyUI workflow into a clean layered layout based on its data flow — whole graph, a selection, or inside a group frame — via node execution, a button, the right-click menu or Alt+Shift+S. Fully deterministic, no network calls."
 requires-python = ">=3.9"
 dependencies = []
 

@@ -1,5 +1,5 @@
 """Standalone sanity tests for layout_core.compute_layout: refit mode,
-cluster mode (disjoint group frames), nested groups, LLM extra clusters,
+cluster mode (disjoint group frames), nested groups, extra (synthetic) clusters,
 NaN sanitization, stale-group parking, degenerate input.
 
 Run: python3 tests/test_layout.py (no ComfyUI required)."""

@@ -30,22 +30,6 @@
       "animate": {
         "name": "애니메이션"
       },
-      "llm_prompt": {
-        "name": "LLM 지시 (선택)",
-        "tooltip": "원하는 정렬을 자연어로 적으면 LLM이 이 노드의 설정으로 번역합니다. 비워두면 LLM을 전혀 사용하지 않습니다."
-      },
-      "llm_provider": {
-        "name": "LLM 제공자"
-      },
-      "llm_base_url": {
-        "name": "LLM 주소"
-      },
-      "llm_model": {
-        "name": "LLM 모델"
-      },
-      "llm_max_tokens": {
-        "name": "LLM 최대 토큰"
-      },
       "trigger": {
         "name": "트리거",
         "tooltip": "선택 사항. 아무 출력이나 연결해 실행 시점을 조절합니다."

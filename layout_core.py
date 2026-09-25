@@ -721,7 +721,7 @@ def _build_hierarchy(nodes, groups, extra_clusters=None, synthetic_start=0):
     bounds contain its center (strict area ordering keeps this acyclic).
     Each node belongs to the smallest group containing its center.
 
-    `extra_clusters` ([{"name", "node_ids"}], e.g. LLM suggestions) become
+    `extra_clusters` ([{"name", "node_ids"}], e.g. from a programmatic caller) become
     synthetic root-level groups indexed from `synthetic_start`. They only
     claim nodes that no real group contains, so user groups always win.
     """
@@ -1172,7 +1172,7 @@ def _park_stale_groups(groups, framed_indices, occupied_rects, v_spacing):
 def compute_layout(workflow, options=None, extra_clusters=None):
     """Compute a tidy layout for a serialized ComfyUI workflow.
 
-    `extra_clusters` ([{"name", "node_ids"}], e.g. LLM suggestions) are laid
+    `extra_clusters` ([{"name", "node_ids"}], e.g. from a programmatic caller) are laid
     out as synthetic groups around nodes no real group contains; they come
     back under "new_groups" so the frontend can create named frames.
 

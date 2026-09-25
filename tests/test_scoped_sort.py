@@ -11,7 +11,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from test_llm_e2e import (  # noqa: E402
+from helpers import (  # noqa: E402
     TITLE_HEIGHT, layout_sort, make_workflow, node_map, rect_inside,
     visual_rect,
 )
